@@ -28580,6 +28580,38 @@ class Compiler
       @needs_rb_value = 1
       return "poly"
     end
+    # `obj.attr = v` -- attr_accessor / attr_writer call. Ruby
+    # semantics: the assignment expression yields the assigned
+    # value. Across the dispatch arms the per-class ivar might
+    # disagree on type (one Box stores int, another stores str),
+    # in which case the unified return widens to poly. Without
+    # this case the writer call's result temp falls through to
+    # the int default and the per-arm assignments are emitted
+    # against a mrb_int slot, producing both a const-char-into-
+    # int cast warning and an empty arm body since the writer
+    # branch wasn't recognised either (see compile_poly_method_call).
+    if mname.length > 1 && mname[mname.length - 1] == "=" &&
+       mname != "==" && mname != "!=" && mname != "<=" && mname != ">="
+      common_w = ""
+      ci_w = 0
+      while ci_w < @cls_names.length
+        bname_w = mname[0, mname.length - 1]
+        if cls_has_attr_writer(ci_w, bname_w) == 1
+          rt_w = cls_ivar_type(ci_w, "@" + bname_w)
+          if rt_w != ""
+            if common_w == ""
+              common_w = rt_w
+            elsif common_w != rt_w
+              return "poly"
+            end
+          end
+        end
+        ci_w = ci_w + 1
+      end
+      if common_w != ""
+        return common_w
+      end
+    end
     common = ""
     ci = 0
     while ci < @cls_names.length
@@ -28873,6 +28905,36 @@ class Compiler
         else
           emit("    if (" + recv_tmp + ".cls_id == " + i.to_s + ") " + tmp + " = " + rhs + ";")
         end
+      elsif mname.length > 1 && mname[mname.length - 1] == "=" &&
+            mname != "==" && mname != "!=" && mname != "<=" && mname != ">=" &&
+            cls_has_attr_writer(i, mname[0, mname.length - 1]) == 1
+        # `recv.x = v` where `x=` isn't an explicit method on this
+        # class but `attr_accessor :x` (or `attr_writer :x`) was
+        # declared. The reader-side walk above had a parallel arm
+        # for cls_has_attr_reader; without this writer arm the
+        # whole assignment was silently elided -- the SP_TAG_OBJ
+        # block emitted no per-class case and the result temp held
+        # its zero-init default. (Real-world bite: tep's dispatch
+        # loop's `req.passed = false` was a no-op, leaving the
+        # `pass` flag stuck across iterations.)
+        bname_w = mname[0, mname.length - 1]
+        ivar_w = sanitize_ivar("@" + bname_w)
+        cast_w = "((sp_" + cname + " *)" + recv_tmp + ".v.p)"
+        # arg_compiled[0] / arg_types[0] hold the rhs. Box if the
+        # ivar is poly-typed and the call site supplied a concrete
+        # value (mirrors the user-method arm widening above).
+        arg_v_w = arg_compiled.length > 0 ? arg_compiled[0] : "0"
+        arg_t_w = arg_types.length > 0 ? arg_types[0] : ""
+        ivar_t_w = cls_ivar_type(i, "@" + bname_w)
+        if base_type(ivar_t_w) == "poly" && arg_t_w != "poly" && arg_t_w != ""
+          arg_v_w = box_value_to_poly(arg_t_w, arg_v_w)
+        end
+        write_expr = "(" + cast_w + "->" + ivar_w + " = " + arg_v_w + ")"
+        rhs_w = write_expr
+        if is_poly_ret == 1
+          rhs_w = box_val_to_poly(write_expr, ivar_t_w)
+        end
+        emit("    if (" + recv_tmp + ".cls_id == " + i.to_s + ") " + tmp + " = " + rhs_w + ";")
       end
       i = i + 1
     end
