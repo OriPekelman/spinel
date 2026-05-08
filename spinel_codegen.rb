@@ -28920,14 +28920,22 @@ class Compiler
         bname_w = mname[0, mname.length - 1]
         ivar_w = sanitize_ivar("@" + bname_w)
         cast_w = "((sp_" + cname + " *)" + recv_tmp + ".v.p)"
-        # arg_compiled[0] / arg_types[0] hold the rhs. Box if the
-        # ivar is poly-typed and the call site supplied a concrete
-        # value (mirrors the user-method arm widening above).
         arg_v_w = arg_compiled.length > 0 ? arg_compiled[0] : "0"
         arg_t_w = arg_types.length > 0 ? arg_types[0] : ""
         ivar_t_w = cls_ivar_type(i, "@" + bname_w)
-        if base_type(ivar_t_w) == "poly" && arg_t_w != "poly" && arg_t_w != ""
+        ivar_base_w = base_type(ivar_t_w)
+        # Match arg's compile-time shape to the slot's. Three cases:
+        #   - ivar is poly, arg is concrete: box the arg up.
+        #   - ivar is concrete, arg is poly: unbox into the slot's
+        #     C type. Hits when the call site widens to poly across
+        #     classes that disagree on slot type (e.g. IBox{int} +
+        #     SBox{string}); without this the C compiler errors
+        #     "assigning to const char * from sp_RbVal".
+        #   - both concrete and equal: nothing to do.
+        if ivar_base_w == "poly" && arg_t_w != "poly" && arg_t_w != ""
           arg_v_w = box_value_to_poly(arg_t_w, arg_v_w)
+        elsif ivar_base_w != "poly" && ivar_base_w != "" && arg_t_w == "poly"
+          arg_v_w = unbox_poly_to(ivar_t_w, arg_v_w)
         end
         write_expr = "(" + cast_w + "->" + ivar_w + " = " + arg_v_w + ")"
         rhs_w = write_expr
