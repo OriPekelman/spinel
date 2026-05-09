@@ -4039,6 +4039,14 @@ class Compiler
         if rt == "float_array"
           return "float"
         end
+        # User-class ptr_array: `arr.delete_at(i)` returns the
+        # popped instance pointer, typed to the array's element
+        # class. Without this branch the assignment target
+        # (`v = arr.delete_at(i)`) defaults to int and the C
+        # compile fails on the implicit ptr-to-int cast.
+        if is_ptr_array_type(rt) == 1
+          return ptr_array_elem_type(rt)
+        end
       end
       return "int"
     end
@@ -27749,6 +27757,14 @@ class Compiler
       if mname == "push"
         return "(sp_PtrArray_push(" + rc + ", " + compile_arg0(nid) + "), 0)"
       end
+      if mname == "delete_at"
+        # `arr.delete_at(i)` -- remove and return the element at i.
+        # Cast back to the array's element type so the caller binding
+        # (`v = arr.delete_at(0)`) resolves cleanly. Returns NULL on
+        # out-of-range, which the cast leaves at 0/nil for the caller
+        # site (matches the IntArray / StrArray peers).
+        return "((" + ct + ")sp_PtrArray_delete_at(" + rc + ", " + compile_arg0(nid) + "))"
+      end
       if mname == "empty?"
         return "sp_PtrArray_empty(" + rc + ")"
       end
@@ -33446,8 +33462,8 @@ class Compiler
       recv = @nd_receiver[body_nid]
       if recv >= 0 && @nd_type[recv] == "LocalVariableReadNode" && @nd_name[recv] == vname
         if mn == "push" || mn == "pop" || mn == "shift" || mn == "unshift" ||
-           mn == "<<" || mn == "[]=" || mn == "delete" || mn == "clear" ||
-           mn == "insert" || mn == "replace" || mn == "concat" ||
+           mn == "<<" || mn == "[]=" || mn == "delete" || mn == "delete_at" ||
+           mn == "clear" || mn == "insert" || mn == "replace" || mn == "concat" ||
            mn == "sort!" || mn == "reverse!" || mn == "compact!" || mn == "uniq!" ||
            mn == "merge!" || mn == "store" || mn == "update" || mn == "fill"
           return 1
