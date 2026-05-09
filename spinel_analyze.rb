@@ -430,6 +430,7 @@ class Compiler
     @needs_str_poly_hash = 0
     @needs_sym_poly_hash = 0
     @cls_cmeth_live = ""
+    @cls_meth_live = ""
     @multi_const_inits = "".split(",")
 
     # Lambda support
@@ -14435,6 +14436,7 @@ class Compiler
     collect_sym_names
     scan_toplevel_ivars(@root_id)
     compute_live_cls_methods
+    compute_live_instance_methods
     @analysis_frozen = 1
     precompute_all_scope_decls
     annotate_all_node_types
@@ -16157,6 +16159,177 @@ class Compiler
       iter = iter + 1
     end
   end
+  # Issue #393. Mark instance methods reachable from the program
+  # entry. Anything not marked gets a stub body at emit time
+  # (`(void)params; return default;`) so an uncalled `def f(x); @typed = x; end`
+  # whose param defaulted to int doesn't fail C-compile against a
+  # narrower ivar slot.
+  #
+  # Conservative liveness: a method `M` on class `C` is live iff:
+  #   1. `M` == "initialize" (constructor synth always reaches it).
+  #   2. Some CallNode anywhere in the program names `M`.
+  #   3. Some SymbolNode anywhere has value `M` (covers method(:M) /
+  #      define_method(:M) / send(:M, ...) reflection sites).
+  # This over-approximates -- a method named "size" on user class `C`
+  # is marked live whenever ANY call site (even an unrelated
+  # `arr.size`) names "size". That's fine for the DCE goal; the
+  # downside is false-negatives (a genuinely-unused method we keep)
+  # rather than false-positives (a live method we strip).
+  def compute_live_instance_methods
+    @cls_meth_live = ""
+    # Step 1: methods whose name is always-implicitly-dispatched are
+    # marked live unconditionally. `<=>` is reached by Comparable's
+    # `<` / `>` etc. operators (compile_call_expr's cmp_owner arm
+    # synthesises the call, so `<=>` itself never appears as a
+    # CallNode name in the AST — and the conservative "name appears
+    # somewhere" rule below would miss it). Same for the bracket
+    # operators, common conversion methods, and `inspect` / `to_s`
+    # called by string interpolation, `puts`, etc.
+    always_live = ["initialize", "<=>", "==", "!=", "eql?", "hash",
+                   "to_s", "inspect", "to_a", "to_i", "to_f", "to_str",
+                   "[]", "[]=", "each", "<", ">", "<=", ">=",
+                   "+", "-", "*", "/", "%", "<<", "coerce", "<<="]
+    ci = 0
+    while ci < @cls_names.length
+      mnames_init = @cls_meth_names[ci].split(";")
+      mj_init = 0
+      while mj_init < mnames_init.length
+        ai = 0
+        while ai < always_live.length
+          if mnames_init[mj_init] == always_live[ai]
+            cls_meth_mark_live(ci, always_live[ai])
+          end
+          ai = ai + 1
+        end
+        mj_init = mj_init + 1
+      end
+      ci = ci + 1
+    end
+    # Step 2/3: collect every CallNode name + SymbolNode value, mark
+    # methods on every class that has them.
+    # `"".split(",")` initializer types `used` as a str_array, since
+    # `acc` in collect_used_method_names is pushed strings only.
+    used = "".split(",")
+    collect_used_method_names(@root_id, used)
+    # Lifted instance_eval blocks: their bodies were detached from
+    # @root_id by ieval_rewrite_call and stashed in @ieval_body_ids,
+    # so a walk from @root_id misses any `get("/")` / similar call
+    # buried inside `app.instance_eval { get("/") }`. Walk them too.
+    ie = 0
+    while ie < @ieval_body_ids.length
+      collect_used_method_names(@ieval_body_ids[ie], used)
+      ie = ie + 1
+    end
+    # User-defined method bodies: top-level methods (@meth_body_ids)
+    # and instance / class methods (@cls_meth_bodies + @cls_cmeth_bodies).
+    # The @root_id walk hits class definitions but those routes only to
+    # ClassNode -> body, not to each method body's nested call sites.
+    mi_b = 0
+    while mi_b < @meth_body_ids.length
+      collect_used_method_names(@meth_body_ids[mi_b], used)
+      mi_b = mi_b + 1
+    end
+    ci_b = 0
+    while ci_b < @cls_names.length
+      mb_list = @cls_meth_bodies[ci_b].split(";")
+      mbk = 0
+      while mbk < mb_list.length
+        bid_mb = mb_list[mbk].to_i
+        if bid_mb > 0
+          collect_used_method_names(bid_mb, used)
+        end
+        mbk = mbk + 1
+      end
+      cmb_list = @cls_cmeth_bodies[ci_b].split(";")
+      cmbk = 0
+      while cmbk < cmb_list.length
+        bid_cmb = cmb_list[cmbk].to_i
+        if bid_cmb > 0
+          collect_used_method_names(bid_cmb, used)
+        end
+        cmbk = cmbk + 1
+      end
+      ci_b = ci_b + 1
+    end
+    ui = 0
+    while ui < used.length
+      uname = used[ui]
+      ci2 = 0
+      while ci2 < @cls_names.length
+        mns = @cls_meth_names[ci2].split(";")
+        mj2 = 0
+        while mj2 < mns.length
+          if mns[mj2] == uname
+            cls_meth_mark_live(ci2, uname)
+          end
+          mj2 = mj2 + 1
+        end
+        ci2 = ci2 + 1
+      end
+      ui = ui + 1
+    end
+  end
+
+  # Walk the AST collecting CallNode names + SymbolNode values into
+  # `acc`. Used by compute_live_instance_methods. Iterative (explicit
+  # stack via `push_child_ids`) so we don't recurse into 600+-deep
+  # method bodies and blow the stack.
+  def collect_used_method_names(nid, acc)
+    if nid < 0
+      return
+    end
+    t = @nd_type[nid]
+    if t == "CallNode"
+      cname = @nd_name[nid]
+      if cname != "" && not_in(cname, acc) == 1
+        acc.push(cname)
+      end
+    end
+    if t == "SymbolNode"
+      sval = @nd_content[nid]
+      if sval != "" && not_in(sval, acc) == 1
+        acc.push(sval)
+      end
+    end
+    cs = []
+    push_child_ids(nid, cs)
+    ck = 0
+    while ck < cs.length
+      collect_used_method_names(cs[ck], acc)
+      ck = ck + 1
+    end
+  end
+
+  def cls_meth_is_live(ci, mname)
+    if ci < 0 || ci >= @cls_names.length
+      return 0
+    end
+    if @cls_meth_live == nil || @cls_meth_live == ""
+      return 0
+    end
+    needle = ";" + @cls_names[ci] + "::" + mname + ";"
+    haystack = ";" + @cls_meth_live + ";"
+    if haystack.include?(needle)
+      return 1
+    end
+    0
+  end
+
+  def cls_meth_mark_live(ci, mname)
+    if ci < 0 || ci >= @cls_names.length
+      return
+    end
+    if cls_meth_is_live(ci, mname) == 1
+      return
+    end
+    entry = @cls_names[ci] + "::" + mname
+    if @cls_meth_live == ""
+      @cls_meth_live = entry
+    else
+      @cls_meth_live = @cls_meth_live + ";" + entry
+    end
+  end
+
 
   def cls_cmeth_is_live(ci, mname)
     if ci < 0 || ci >= @cls_names.length
@@ -18696,6 +18869,7 @@ class Compiler
 
     # Non-array string ivars (computed in analyze, consumed by emit)
     buf = buf + "STR @cls_cmeth_live " + ir_escape(@cls_cmeth_live) + "\n"
+    buf = buf + "STR @cls_meth_live " + ir_escape(@cls_meth_live) + "\n"
 
     # Per-AST-node records (T / NM / NB / SN / ST) get accumulated
     # into a StrArray and joined once. Building them with `buf + ...`

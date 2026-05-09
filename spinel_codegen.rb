@@ -7038,6 +7038,20 @@ class Compiler
   # by `;` in @cls_cmeth_live. Idempotent: marking an already-live
   # entry is a no-op.
 
+  def cls_meth_is_live(ci, mname)
+    if ci < 0 || ci >= @cls_names.length
+      return 0
+    end
+    if @cls_meth_live == nil || @cls_meth_live == ""
+      return 0
+    end
+    needle = ";" + @cls_names[ci] + "::" + mname + ";"
+    haystack = ";" + @cls_meth_live + ";"
+    if haystack.include?(needle)
+      return 1
+    end
+    0
+  end
   def cls_cmeth_is_live(ci, mname)
     if ci < 0 || ci >= @cls_names.length
       return 0
@@ -7576,7 +7590,21 @@ class Compiler
         is_tramp = 1
       end
     end
-    if bid >= 0 && is_tramp == 0
+    # Issue #393: stub uncalled methods so an inferred-int param
+    # doesn't fail C-compile against a narrower ivar slot.
+    is_dead = 0
+    if cls_meth_is_live(ci, mname) == 0
+      is_dead = 1
+    end
+    if is_dead == 1
+      # Mark every param as `(void)`-cast so -Wunused doesn't fire,
+      # then return the default.
+      jd = 0
+      while jd < pnames.length
+        emit("  (void)lv_" + pnames[jd] + ";")
+        jd = jd + 1
+      end
+    elsif bid >= 0 && is_tramp == 0
       declare_method_locals(bid, pnames)
       if @in_gc_scope == 0
         if @needs_gc == 1
@@ -27763,6 +27791,8 @@ class Compiler
   def ir_set_str_ivar(name, val)
     if name == "@cls_cmeth_live"
       @cls_cmeth_live = val
+    elsif name == "@cls_meth_live"
+      @cls_meth_live = val
     end
   end
 
