@@ -2338,6 +2338,31 @@ class Compiler
           return "obj_" + implicit
         end
       end
+      # Comparison / boolean operators always return bool, regardless
+      # of recv type. scan_lambda_ret_types calls infer_type on a
+      # lambda body's last expr — when that's `a > b` inside a
+      # lambda body that walk_and_cache skipped, the cache misses
+      # and this fallback used to default to "int", which made the
+      # outer `.to_s` emit `sp_int_to_s(...)` instead of the bool
+      # ternary `(... ? "true" : "false")`.
+      cmp_mname = @nd_name[nid]
+      if cmp_mname == "<" || cmp_mname == ">" || cmp_mname == "<=" || cmp_mname == ">=" || cmp_mname == "==" || cmp_mname == "!=" || cmp_mname == "===" || cmp_mname == "eql?" || cmp_mname == "equal?" || cmp_mname == "is_a?" || cmp_mname == "kind_of?" || cmp_mname == "instance_of?" || cmp_mname == "respond_to?" || cmp_mname == "include?" || cmp_mname == "start_with?" || cmp_mname == "end_with?" || cmp_mname == "match?" || cmp_mname == "empty?" || cmp_mname == "nil?" || cmp_mname == "zero?" || cmp_mname == "even?" || cmp_mname == "odd?" || cmp_mname == "frozen?"
+        return "bool"
+      end
+      # `lv.call(...)` / `lv.()` on a lambda local — recover the
+      # lambda's recorded return type from @lambda_var_ret_*.
+      # walk_and_cache skips lambda bodies, so the call itself isn't
+      # cached; without this the outer `.to_s` (etc.) would default
+      # to "int" and emit sp_int_to_s on a bool/string return.
+      if cmp_mname == "call" || cmp_mname == "[]"
+        cmp_recv = @nd_receiver[nid]
+        if cmp_recv >= 0 && @nd_type[cmp_recv] == "LocalVariableReadNode"
+          lrt = lambda_var_ret_type(@nd_name[cmp_recv])
+          if lrt != ""
+            return lrt
+          end
+        end
+      end
       return "int"
     end
     if t == "IfNode"
@@ -26782,7 +26807,11 @@ class Compiler
     if bid >= 0
       flocals_n = "".split(",")
       flocals_t = "".split(",")
-      scan_locals(bid, flocals_n, flocals_t, pnames)
+      sn_yc = @nd_scope_names[bid]
+      if sn_yc != ""
+        flocals_n = sn_yc.split("|")
+        flocals_t = @nd_scope_types[bid].split("|")
+      end
       kf = 0
       while kf < flocals_n.length
         tname = flocals_n[kf] + suffix

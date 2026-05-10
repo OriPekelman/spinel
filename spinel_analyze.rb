@@ -18308,6 +18308,133 @@ class Compiler
     ""
   end
 
+  # if midx is out of range or the body id is invalid. Centralises
+  # the @cls_meth_bodies[ci].split(";")[midx].to_i parse so detectors
+  # don't have to inline it.
+  def cls_method_body_id(ci, midx)
+    bodies = @cls_meth_bodies[ci].split(";")
+    if midx >= bodies.length
+      return -1
+    end
+    bid = bodies[midx].to_i
+    if bid < 0
+      return -1
+    end
+    bid
+  end
+
+  # Walk `nid` for YieldNode, accumulating the per-position arg
+  # type into `types`. Stops at nested DefNode boundaries (those
+  # introduce a new method scope with its own yield arity).
+  # Mirrors body_max_yield_arity's traversal shape.
+  def body_yield_arg_types(nid, types)
+    if nid < 0
+      return
+    end
+    if @nd_type[nid] == "YieldNode"
+      if @nd_arguments[nid] >= 0
+        args = get_args(@nd_arguments[nid])
+        k = 0
+        while k < args.length
+          if k < types.length
+            at = infer_type(args[k])
+            if types[k] == ""
+              types[k] = at
+            elsif types[k] != at
+              types[k] = unify_call_types(types[k], at, args[k])
+            end
+          end
+          k = k + 1
+        end
+      end
+      return
+    end
+    if @nd_type[nid] == "DefNode"
+      return
+    end
+    cs = []
+    push_child_ids(nid, cs)
+    k = 0
+    while k < cs.length
+      body_yield_arg_types(cs[k], types)
+      k = k + 1
+    end
+  end
+
+  def cls_method_has_yield(ci, midx)
+    ystr = @cls_meth_has_yield[ci].split(";")
+    if midx < ystr.length
+      if ystr[midx] == "1"
+        return 1
+      end
+    end
+    0
+  end
+
+  # Max number of args used in any `yield` inside the top-level method
+  # at @meth_body_ids[mi]. Floor of 1 — yield-using methods always have
+  # at least one mrb_int slot (the no-arg `yield` form is padded to 0).
+  def method_yield_arity(mi)
+    if mi < 0 || mi >= @meth_body_ids.length
+      return 1
+    end
+    body_max_yield_arity(@meth_body_ids[mi], 1)
+  end
+
+  # Same as method_yield_arity, but resolved through the class method
+  # body table @cls_meth_bodies (parallel to @cls_meth_has_yield).
+  # Mirrors body_has_yield's recursion shape. `current` carries the running
+  # max so callers can seed a floor (1, since every yield-using method needs
+  # at least one mrb_int slot in `_block`'s signature).
+  def body_max_yield_arity(nid, current)
+    if nid < 0
+      return current
+    end
+    if @nd_type[nid] == "YieldNode"
+      n = 0
+      if @nd_arguments[nid] >= 0
+        n = get_args(@nd_arguments[nid]).length
+      end
+      if n < 1
+        n = 1
+      end
+      if n > current
+        current = n
+      end
+    end
+    if @nd_type[nid] == "DefNode"
+      return current
+    end
+    cs = []
+    push_child_ids(nid, cs)
+    k = 0
+    while k < cs.length
+      current = body_max_yield_arity(cs[k], current)
+      k = k + 1
+    end
+    current
+  end
+
+  # ---- Return type inference ----
+
+  # Narrow pre-pass for `rewrite_instance_eval_calls`: walk top-level
+  # CallNodes shaped `recv.method(args)` where recv resolves to an
+  # obj_<C> via top-level scope, and let scan_new_calls' receiver-method
+  # branch widen the class method's ptypes. Without this, a method-param
+
+  def cls_method_yield_arity(ci, midx)
+    if ci < 0 || midx < 0
+      return 1
+    end
+    bodies = @cls_meth_bodies[ci].split(";")
+    if midx >= bodies.length
+      return 1
+    end
+    bid = bodies[midx].to_i
+    body_max_yield_arity(bid, 1)
+  end
+
+
   # `recv OP rhs` lowering for an obj-typed receiver. When the
   # receiver's class (or an ancestor) defines `op` as a user method,
   # returns the C expression `sp_<owner>_<op>(<recv_c>, <rhs_c>)`.
@@ -19169,6 +19296,19 @@ class Compiler
     # type at the defining class's instance.
     if nt == "CallNode" && @nd_receiver[nid] < 0 && @nd_name[nid] == "new"
       skip_cache = 1
+    end
+    # `lambda.call(...)` — the return type comes from
+    # @lambda_var_ret_types which is built at codegen time (issue #400
+    # multi-arg lambda). Caching at analyze would freeze the type as
+    # "int" before scan_lambda_ret_types runs, and the outer `.to_s`
+    # would emit sp_int_to_s instead of the bool ternary. Limited to
+    # the literal `.call` shape (NOT `[]` — that's str_array indexing
+    # in too many other places to skip safely).
+    if nt == "CallNode" && @nd_name[nid] == "call"
+      crv = @nd_receiver[nid]
+      if crv >= 0 && @nd_type[crv] == "LocalVariableReadNode"
+        skip_cache = 1
+      end
     end
     if skip_cache == 0
       @nd_inferred_type[nid] = infer_type(nid)
