@@ -717,7 +717,7 @@ static const char*sp_FloatArray_inspect(sp_FloatArray*a){sp_String*s=sp_String_n
 static const char*sp_StrArray_inspect(sp_StrArray*a){sp_String*s=sp_String_new("[");for(mrb_int i=0;i<a->len;i++){if(i>0)sp_String_append(s,", ");sp_String_append(s,sp_str_inspect(a->data[i]));}sp_String_append(s,"]");return s->data;}
 /* Symbol arrays share the IntArray representation (sp_sym = mrb_int),
    but each element is rendered as ":name" via sp_sym_to_s. */
-static const char*sp_SymArray_inspect(sp_IntArray*a){sp_String*s=sp_String_new("[");for(mrb_int i=0;i<a->len;i++){if(i>0)sp_String_append(s,", ");sp_String_append(s,":");sp_String_append(s,sp_sym_to_s((sp_sym)a->data[a->start+i]));}sp_String_append(s,"]");return s->data;}
+static inline const char*sp_SymArray_inspect(sp_IntArray*a){sp_String*s=sp_String_new("[");for(mrb_int i=0;i<a->len;i++){if(i>0)sp_String_append(s,", ");sp_String_append(s,":");sp_String_append(s,sp_sym_to_s((sp_sym)a->data[a->start+i]));}sp_String_append(s,"]");return s->data;}
 /* PtrArray elements are object pointers without a per-element class
    tag, so we render them as `#<Object>` rather than recursing. */
 static const char*sp_PtrArray_inspect(sp_PtrArray*a){sp_String*s=sp_String_new("[");for(mrb_int i=0;i<a->len;i++){if(i>0)sp_String_append(s,", ");sp_String_append(s,"#<Object>");}sp_String_append(s,"]");return s->data;}
@@ -1006,7 +1006,7 @@ static const char *sp_Time_inspect(sp_Time *t) {
   return buf;
 }
 static sp_RbVal sp_box_poly_array(void *p)  { return sp_box_obj(p, SP_BUILTIN_POLY_ARRAY); }
-static void sp_poly_puts(sp_RbVal v) {
+static inline void sp_poly_puts(sp_RbVal v) {
   switch (v.tag) {
     case SP_TAG_INT: printf("%lld\n", (long long)v.v.i); break;
     case SP_TAG_STR: if (v.v.s) { fputs(v.v.s, stdout); if (!*v.v.s || v.v.s[strlen(v.v.s)-1] != '\n') putchar('\n'); } else putchar('\n'); break;
@@ -1037,11 +1037,13 @@ static void sp_poly_puts(sp_RbVal v) {
 static mrb_bool sp_poly_nil_p(sp_RbVal v) { return v.tag == SP_TAG_NIL; }
 static mrb_bool sp_poly_truthy(sp_RbVal v) { return !(v.tag == SP_TAG_NIL || (v.tag == SP_TAG_BOOL && !v.v.b)); }
 /* Issue #404 Phase 3: forward-declare the program-emitted class
-   name lookup so sp_poly_to_s's SP_TAG_CLASS arm resolves. The
-   codegen emits sp_class_to_s unconditionally (even for programs
-   with no user classes), so the link is always satisfied. */
+   name lookup so sp_poly_to_s's SP_TAG_CLASS arm resolves.
+   The codegen emits a 1-line stub when no class const is used,
+   or the real body when @needs_class_table fires. The forward
+   decl always needs a definition somewhere because -Werror
+   trips on "used but never defined" otherwise. */
 static const char *sp_class_to_s(sp_Class c);
-static const char *sp_poly_to_s(sp_RbVal v) {
+static inline const char *sp_poly_to_s(sp_RbVal v) {
   switch (v.tag) {
     case SP_TAG_INT: return sp_int_to_s(v.v.i);
     case SP_TAG_STR: return v.v.s ? v.v.s : sp_str_empty;
@@ -1150,7 +1152,7 @@ static sp_PolyArray *sp_PolyArray_shuffle(sp_PolyArray *a) { sp_PolyArray *b = s
    each branch reuses the matching primitive inspect helper. Falls back
    to "#<Object>" for SP_TAG_OBJ because the runtime has no class-name
    table yet (follow-up PR). Returns a GC-managed C string. */
-static const char *sp_poly_inspect(sp_RbVal v) {
+static inline const char *sp_poly_inspect(sp_RbVal v) {
   switch (v.tag) {
     case SP_TAG_INT:  return sp_int_to_s(v.v.i);
     case SP_TAG_STR:  return sp_str_inspect(v.v.s);

@@ -6352,17 +6352,14 @@ class Compiler
   # array (~one cache line for typical small programs, ~1KB at
   # spinel_codegen scale).
   def emit_class_runtime
-    # When the program has no Class-value usage (no ConstantReadNode
-    # for a class/module name, no `.class` call, no hierarchy
-    # methods), skip the heavy table + helpers. sp_runtime.h's
-    # sp_poly_to_s forward-declares sp_class_to_s and references
-    # it from its SP_TAG_CLASS arm. -O3 DCE doesn't always remove
-    # sp_poly_to_s in time (it's `static const char *`, not
-    # `static inline`), so the link fails on the unresolved
-    # sp_class_to_s. Cheapest fix: emit a 1-line stub that
-    # returns "" regardless. SP_TAG_CLASS values can't exist at
-    # runtime when no class const is boxed, so the stub is
-    # statically dead but satisfies the linker.
+    # When the program has no Class-value usage, skip the heavy
+    # table + helpers but emit a 1-line stub for sp_class_to_s.
+    # sp_runtime.h's sp_poly_to_s / sp_poly_inspect chain
+    # forward-declares sp_class_to_s and references it in inline
+    # bodies; -O2+ DCE's the unused chain, but the
+    # codegen-emitted .c is built with -Werror and trips
+    # "warning: 'sp_class_to_s' used but never defined" without
+    # a definition.
     if @needs_class_table == 0
       emit_raw("static const char *sp_class_to_s(sp_Class c){(void)c;return \"\";}")
       return
@@ -6774,7 +6771,13 @@ class Compiler
       emit_raw("static void sp_sym_array_sort(sp_IntArray*a) __attribute__((unused));")
       emit_raw("static void sp_sym_array_sort(sp_IntArray*a){qsort(a->data+a->start,a->len,sizeof(mrb_int),sp_sym_sort_cmp);}")
     else
-      # No symbols used at all — provide stub for sp_runtime.h's SP_TAG_SYM
+      # No symbols used at all -- emit a 1-line stub.
+      # sp_runtime.h's poly_to_s / poly_puts / poly_inspect /
+      # SymArray_inspect chain references sp_sym_to_s in inline
+      # bodies; -O2+ DCE's them when unused, but -Werror trips
+      # on "used but never defined" without a definition. The
+      # stub is statically dead (no SP_TAG_SYM values exist when
+      # no symbol is ever boxed).
       emit_raw("static const char *sp_sym_to_s(sp_sym id){(void)id;return \"\";}")
     end
     emit_raw("")
