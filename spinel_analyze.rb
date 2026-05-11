@@ -14853,6 +14853,13 @@ class Compiler
       infer_param_array_type_from_body
       narrow_param_types_from_body_method_calls
       narrow_param_hash_types_from_body_writes
+      # Issue #424: propagate hash-each block-arg types into
+      # nested cmeth/method-call param widening. Runs inside
+      # the iterative loop so a later iteration of
+      # narrow_param_hash_types_from_body_writes (which may
+      # pin the enclosing param to a more specific hash variant)
+      # gets its k/v types fed downstream too.
+      widen_cmeths_via_hash_each_blocks
       detect_poly_params
       cur_sig = inference_signature
       if cur_sig == prev_sig
@@ -20253,6 +20260,231 @@ class Compiler
       end
       ci = ci + 1
     end
+  end
+
+  # Issue #424: hash-each block-arg widening for nested cmeth /
+  # method calls. The in-pipeline scan_new_calls runs without
+  # the iterator's k/v scope pushed, so a call site like
+  # `Json.escape(k)` inside `h.each |k, v| { ... }` sees k as
+  # untyped and the cmeth's param ends up at the int default.
+  # The block-scope push approach (matz comment, option 2/3)
+  # perturbed #207's symbolize_keys convergence; this pass
+  # stays surgical -- for every hash-typed param p of a method,
+  # find any `lv_p.each |k, v|` blocks in the body and walk the
+  # block body for `<recv>.<m>(args)` where args reference k or
+  # v. Widen the called method's param types from the hash's
+  # key/value variant only at those specific sites, leaving
+  # scan_new_calls and the wider iterative loop untouched.
+  def widen_cmeths_via_hash_each_blocks
+    # Top-level methods.
+    mi = 0
+    while mi < @meth_names.length
+      bid_h = @meth_body_ids[mi]
+      if bid_h >= 0
+        pnames = @meth_param_names[mi].split(",")
+        ptypes = @meth_param_types[mi].split(",")
+        each_widen_walk(bid_h, pnames, ptypes)
+      end
+      mi = mi + 1
+    end
+    # Class instance methods.
+    ci = 0
+    while ci < @cls_names.length
+      all_params = @cls_meth_params[ci].split("|")
+      all_ptypes = @cls_meth_ptypes[ci].split("|")
+      bodies = @cls_meth_bodies[ci].split(";")
+      mj = 0
+      while mj < all_params.length
+        bid_c = -1
+        if mj < bodies.length
+          bid_c = bodies[mj].to_i
+        end
+        if bid_c >= 0
+          cm_pnames = all_params[mj].split(",")
+          cm_ptypes = "".split(",")
+          if mj < all_ptypes.length
+            cm_ptypes = all_ptypes[mj].split(",")
+          end
+          each_widen_walk(bid_c, cm_pnames, cm_ptypes)
+        end
+        mj = mj + 1
+      end
+      ci = ci + 1
+    end
+    # Class methods (cmeths).
+    ci = 0
+    while ci < @cls_names.length
+      all_params = @cls_cmeth_params[ci].split("|")
+      all_ptypes = @cls_cmeth_ptypes[ci].split("|")
+      bodies = @cls_cmeth_bodies[ci].split(";")
+      mj = 0
+      while mj < all_params.length
+        bid_c = -1
+        if mj < bodies.length
+          bid_c = bodies[mj].to_i
+        end
+        if bid_c >= 0
+          cm_pnames = all_params[mj].split(",")
+          cm_ptypes = "".split(",")
+          if mj < all_ptypes.length
+            cm_ptypes = all_ptypes[mj].split(",")
+          end
+          each_widen_walk(bid_c, cm_pnames, cm_ptypes)
+        end
+        mj = mj + 1
+      end
+      ci = ci + 1
+    end
+  end
+
+  # Recurse through `nid` looking for `<local>.each |k, v| { body }`
+  # where `<local>` matches one of the enclosing method's hash-typed
+  # params. When found, walk the block body for nested call sites
+  # whose args reference k or v and widen the called method's
+  # param types accordingly.
+  def each_widen_walk(nid, pnames, ptypes)
+    if nid < 0
+      return
+    end
+    t = @nd_type[nid]
+    if t == "CallNode" && @nd_name[nid] == "each" && @nd_block[nid] >= 0
+      recv = @nd_receiver[nid]
+      if recv >= 0 && @nd_type[recv] == "LocalVariableReadNode"
+        local_name = @nd_name[recv]
+        # Locate the param's type in the enclosing method.
+        local_t = ""
+        pi = 0
+        while pi < pnames.length
+          if pnames[pi] == local_name
+            if pi < ptypes.length
+              local_t = ptypes[pi]
+            end
+            pi = pnames.length
+          else
+            pi = pi + 1
+          end
+        end
+        if is_hash_type(local_t) == 1
+          k_name_424 = get_block_param(nid, 0)
+          v_name_424 = get_block_param(nid, 1)
+          if k_name_424 != "" && v_name_424 != ""
+            k_t_424 = hash_key_type_from_variant(local_t)
+            v_t_424 = hash_leaf_type(local_t)
+            blk = @nd_block[nid]
+            block_body = @nd_body[blk]
+            widen_callsites_referencing_kv(block_body, k_name_424, k_t_424, v_name_424, v_t_424)
+          end
+        end
+      end
+    end
+    cs = []
+    push_child_ids(nid, cs)
+    k = 0
+    while k < cs.length
+      each_widen_walk(cs[k], pnames, ptypes)
+      k = k + 1
+    end
+  end
+
+  # Walk the block body. For each CallNode whose args reference
+  # `k_name` / `v_name`, widen the called method's param types
+  # from the hash-derived k/v types. Covers <Class>.<cmeth>(...)
+  # constant-recv shape (the canonical #424 repro). Other shapes
+  # (bare method, instance recv) stay handled by the existing
+  # iterative loop.
+  def widen_callsites_referencing_kv(nid, k_name, k_t, v_name, v_t)
+    if nid < 0
+      return
+    end
+    if @nd_type[nid] == "CallNode"
+      mname_w = @nd_name[nid]
+      recv_w = @nd_receiver[nid]
+      args_id_w = @nd_arguments[nid]
+      if recv_w >= 0 && @nd_type[recv_w] == "ConstantReadNode" && args_id_w >= 0
+        cls_name_w = @nd_name[recv_w]
+        ci_w = find_class_idx(cls_name_w)
+        if ci_w >= 0
+          cm_names_w = @cls_cmeth_names[ci_w].split(";")
+          cmpall_w = @cls_cmeth_ptypes[ci_w].split("|")
+          cmi_w = 0
+          while cmi_w < cm_names_w.length
+            if cm_names_w[cmi_w] == mname_w && cmi_w < cmpall_w.length
+              cmpt_w = cmpall_w[cmi_w].split(",")
+              arg_ids_w = get_args(args_id_w)
+              ai_w = 0
+              changed_w = 0
+              while ai_w < arg_ids_w.length && ai_w < cmpt_w.length
+                arg_t_w = arg_type_in_each_block(arg_ids_w[ai_w], k_name, k_t, v_name, v_t)
+                if arg_t_w != ""
+                  new_t_w = unify_call_types(cmpt_w[ai_w], arg_t_w, arg_ids_w[ai_w])
+                  if new_t_w != cmpt_w[ai_w]
+                    cmpt_w[ai_w] = new_t_w
+                    changed_w = 1
+                  end
+                end
+                ai_w = ai_w + 1
+              end
+              if changed_w == 1
+                cmpall_w[cmi_w] = cmpt_w.join(",")
+                @cls_cmeth_ptypes[ci_w] = cmpall_w.join("|")
+                @cls_cmeth_ptypes_version = @cls_cmeth_ptypes_version + 1
+              end
+            end
+            cmi_w = cmi_w + 1
+          end
+        end
+      end
+    end
+    cs2 = []
+    push_child_ids(nid, cs2)
+    k = 0
+    while k < cs2.length
+      widen_callsites_referencing_kv(cs2[k], k_name, k_t, v_name, v_t)
+      k = k + 1
+    end
+  end
+
+  # Returns the type to use for `arg` in the context of an each
+  # block where k/v have hash-derived types. Mirrors infer_type
+  # for the LocalVariableReadNode case but pins k/v to their
+  # hash-derived types instead of consulting the (empty) var-type
+  # table.
+  def arg_type_in_each_block(arg, k_name, k_t, v_name, v_t)
+    if arg < 0
+      return ""
+    end
+    if @nd_type[arg] == "LocalVariableReadNode"
+      n = @nd_name[arg]
+      if n == k_name
+        return k_t
+      end
+      if n == v_name
+        return v_t
+      end
+    end
+    ""
+  end
+
+  # Hash key type from a variant name. "str_int_hash" -> "string",
+  # "sym_int_hash" -> "symbol", etc. Mirrors hash_leaf_type's
+  # value-side counterpart.
+  def hash_key_type_from_variant(t)
+    if is_nullable_type(t) == 1
+      t = base_type(t)
+    end
+    if t == "str_int_hash" || t == "str_str_hash" || t == "str_poly_hash"
+      return "string"
+    end
+    if t == "sym_int_hash" || t == "sym_str_hash" || t == "sym_poly_hash"
+      return "symbol"
+    end
+    if t == "int_str_hash"
+      return "int"
+    end
+    if t == "poly_poly_hash"
+      return "poly"
+    end
+    ""
   end
 
   # Walk the method body looking for `lv_<pname>[k] = v` writes
