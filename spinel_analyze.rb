@@ -20578,7 +20578,38 @@ class Compiler
       end
       j = j + 1
     end
- # Pass 3: lambda upgrade
+ # Pass 3: re-scan with the merged types now reflected in scope.
+ # Intermediate locals (e.g. `pp = pa[i]` where pa is itself a
+ # body local) had their pass-1 type fall back to "int" because
+ # pa wasn't declared yet on pass 1. Pass 2 pushed pp's correct
+ # type into the fresh ln2/lt2 but pp's *global* scope entry
+ # still carried the pass-1 stale type, so a downstream
+ # `h[pp[1..]] = ap` resolved pp via infer_type → "int" and the
+ # empty-hash promotion picked int_str_hash. The merge above
+ # set pp's scope to the merged type; redo scan_locals so the
+ # `[]=` arm now sees pp resolved to its real type and re-picks
+ # the right hash variant. Mirror the merge rules from pass 2.
+    lnames3 = "".split(",")
+    ltypes3 = "".split(",")
+    scan_locals(bid, lnames3, ltypes3, params)
+    j = 0
+    while j < lnames3.length
+      k = 0
+      while k < lnames.length
+        if lnames[k] == lnames3[j]
+          if ltypes[k] == "str_int_hash" && ltypes3[j] == "str_str_hash"
+            ltypes[k] = ltypes3[j]
+            set_var_type(lnames[k], ltypes3[j])
+          elsif ltypes[k] == "int_str_hash" && (ltypes3[j] == "str_str_hash" || ltypes3[j] == "sym_str_hash" || ltypes3[j] == "str_int_hash" || ltypes3[j] == "sym_int_hash")
+            ltypes[k] = ltypes3[j]
+            set_var_type(lnames[k], ltypes3[j])
+          end
+        end
+        k = k + 1
+      end
+      j = j + 1
+    end
+ # Pass 4: lambda upgrade
     j = 0
     while j < lnames.length
       if ltypes[j] == "int"
