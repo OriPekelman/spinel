@@ -2989,6 +2989,31 @@ class Compiler
     0
   end
 
+ # `is_descendant(child, ancestor)` — 1 iff `child` is a strict
+ # (proper) descendant of `ancestor` in the class hierarchy; 0
+ # otherwise (including when they're identical). Wraps
+ # is_class_or_ancestor, which is descendant-OR-EQUAL.
+  def is_descendant(child, ancestor)
+    if child == ancestor
+      return 0
+    end
+    is_class_or_ancestor(child, ancestor)
+  end
+
+ # `is_value_type_class(cname)` — 1 iff `cname` is a user class
+ # marked value-type (stack-allocated, no subclasses by design,
+ # no `cls_id` field on the struct). emit_class_fields gates the
+ # cls_id emission on the inverse of this; runtime cls_id checks
+ # must guard against value-type recvs to avoid referencing a
+ # nonexistent struct member.
+  def is_value_type_class(cname)
+    ci = find_class_idx(cname)
+    if ci >= 0 && @cls_is_value_type[ci] == 1
+      return 1
+    end
+    0
+  end
+
   def is_operator_name(name)
     if name == "+"
       return 1
@@ -17315,16 +17340,41 @@ class Compiler
         end
         if is_class_or_ancestor(cname, arg0) == 1
           return "TRUE"
-        else
-          return "FALSE"
         end
+ # Descendant case: arg0 is a proper subclass of cname (recv's
+ # static type). The recv's static type only bounds the runtime
+ # class above; the instance can be cname or any descendant
+ # including arg0. Consult the recv's actual cls_id slot.
+        target_ci = find_class_idx(arg0)
+        if target_ci >= 0 && is_descendant(arg0, cname) == 1
+          @needs_class_table = 1
+          @needs_class_ancestors = 1
+          recv_id = @nd_receiver[nid]
+          if recv_id >= 0
+            return "sp_class_le((sp_Class){" + compile_expr(recv_id) + "->cls_id}, (sp_Class){" + cls_id_for_user_internal(target_ci).to_s + "LL})"
+          end
+        end
+ # Unrelated classes — neither ancestor nor descendant. Always FALSE.
+        return "FALSE"
       end
       return "FALSE"
     end
 
- # instance_of? — exact class identity, no ancestor walk. A parent
- # instance is never an exact-subclass match, so descendant resolution
- # is not relevant here; static comparison suffices.
+ # instance_of? — exact class identity, no ancestor walk.
+ # The recv's static type only bounds the runtime class above; the
+ # instance can be the static type OR any descendant. The runtime
+ # class can therefore equal arg0 only if arg0 is in that set —
+ # i.e., arg0 is cname or a descendant of cname. Other shapes
+ # (arg0 is an ancestor of cname, or unrelated) make the equality
+ # statically impossible and collapse to FALSE.
+ #
+ # `cname == arg0` does NOT in general collapse to TRUE — a parent-
+ # typed local holding a descendant returns FALSE for
+ # `instance_of?(parent)`. The check is runtime via the recv's
+ # cls_id slot. EXCEPTION: value-type classes have no subclasses
+ # by design (no cls_id field on the struct, no polymorphism), so
+ # for value-type cname the runtime is always exactly cname and
+ # the cname == arg0 check collapses back to static TRUE.
     if mname == "instance_of?"
       if is_obj_type(recv_type) == 1
         cname = recv_type[4, recv_type.length - 4]
@@ -17336,11 +17386,18 @@ class Compiler
             arg0 = resolve_introspection_arg_name(a[0])
           end
         end
-        if cname == arg0
-          return "TRUE"
-        else
-          return "FALSE"
+        target_ci = find_class_idx(arg0)
+        if target_ci >= 0 && (cname == arg0 || is_descendant(arg0, cname) == 1)
+          if is_value_type_class(cname) == 1
+            return "TRUE"
+          end
+          @needs_class_table = 1
+          recv_id = @nd_receiver[nid]
+          if recv_id >= 0
+            return "(" + compile_expr(recv_id) + "->cls_id == " + cls_id_for_user_internal(target_ci).to_s + "LL)"
+          end
         end
+        return "FALSE"
       end
       return "FALSE"
     end
