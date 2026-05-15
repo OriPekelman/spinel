@@ -23096,15 +23096,46 @@ class Compiler
       cond = compile_cond_expr(@nd_predicate[nid])
       emit("  } while (" + cond + ");")
     else
+ # Compile the predicate into a scratch buffer so any side-effecting
+ # emits (compile_expr_gc_rooted's `temp = call(); SP_GC_ROOT(temp);`
+ # for a CallNode receiver, etc.) land INSIDE the loop body instead
+ # of once before it. Issue #500: `while (n = gets.to_i) > 0` hoisted
+ # `_t1 = sp_gets(); SP_GC_ROOT(_t1);` ahead of the while, so every
+ # iteration re-read the same captured first line and the loop never
+ # terminated. Capturing the cond's emits and replaying them inside
+ # the loop body — wrapped in `while (1) { ...; if (!cond) break; ... }`
+ # — keeps the receiver call (and its transient root) per-iteration,
+ # so EOF on stdin actually advances `_t1` and the condition flips.
+      saved_out = @out_lines
+      @out_lines = "".split(",")
       cond = compile_cond_expr(@nd_predicate[nid])
-      emit("  while (" + cond + ") {")
-      @indent = @indent + 1
-      redo_label = push_redo_label
-      emit_redo_label(redo_label)
-      compile_stmts_body(@nd_body[nid])
-      pop_redo_label
-      @indent = @indent - 1
-      emit("  }")
+      cond_hoists = @out_lines
+      @out_lines = saved_out
+      if cond_hoists.length > 0
+        emit("  while (1) {")
+        @indent = @indent + 1
+        ch_i = 0
+        while ch_i < cond_hoists.length
+          @out_lines.push(cond_hoists[ch_i])
+          ch_i = ch_i + 1
+        end
+        emit("if (!(" + cond + ")) break;")
+        redo_label = push_redo_label
+        emit_redo_label(redo_label)
+        compile_stmts_body(@nd_body[nid])
+        pop_redo_label
+        @indent = @indent - 1
+        emit("  }")
+      else
+        emit("  while (" + cond + ") {")
+        @indent = @indent + 1
+        redo_label = push_redo_label
+        emit_redo_label(redo_label)
+        compile_stmts_body(@nd_body[nid])
+        pop_redo_label
+        @indent = @indent - 1
+        emit("  }")
+      end
     end
     @hoisted_strlen_var = saved_var
     @hoisted_strlen_recv = saved_recv
