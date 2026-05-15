@@ -12606,6 +12606,16 @@ class Compiler
       return "0"
     end
 
+ # Bare `name` (or `self.name`) inside `def self.<m>` returns
+ # the class's literal name as a string. Issue #509. Used by
+ # ActiveRecord's "#{name}.table_name must be overridden"
+ # raise pattern. Matches the recv_type == "class" arm in
+ # compile_object_method_expr (which catches the explicit
+ # `Foo.name` form via the class-typed constant receiver).
+    if mname == "name" && @current_method_has_self == 0 && @current_class_idx >= 0
+      @needs_class_table = 1
+      return "sp_class_to_s(((sp_Class){" + cls_id_for_user_internal(@current_class_idx).to_s + "LL}))"
+    end
  # Bare `new` inside a `def self.<m>` body resolves to
  # <CurrentClass>.new. Dispatched here rather than via the
  # later `mname == "new"` branch in compile_call_expr because
@@ -17743,6 +17753,17 @@ class Compiler
   end
 
   def compile_object_method_expr(nid, mname, rc, recv_type)
+ # `self.name` inside `def self.<m>` -- self is typed obj_<C>
+ # by infer_type, but the runtime intent is the class itself.
+ # Route to sp_class_to_s before the obj-dispatch arms below
+ # would emit a no-op. Issue #509.
+    if mname == "name" && @current_method_has_self == 0 && @current_class_idx >= 0
+      recv_n = @nd_receiver[nid]
+      if recv_n >= 0 && @nd_type[recv_n] == "SelfNode"
+        @needs_class_table = 1
+        return "sp_class_to_s(((sp_Class){" + cls_id_for_user_internal(@current_class_idx).to_s + "LL}))"
+      end
+    end
  # methods on a sp_Class value.
  #
  # Phase 1: `.to_s` -> sp_class_to_s(c) (per-program

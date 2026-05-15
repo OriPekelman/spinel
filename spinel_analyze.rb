@@ -3391,6 +3391,16 @@ class Compiler
       if recv >= 0 && infer_type(recv) == "class"
         return "string"
       end
+ # Bare `name` inside `def self.X` body. The implicit recv is
+ # the class. SelfNode there infers as obj_<C>, so this path
+ # is needed for the bare form and (separately) the explicit
+ # `self.name` shape. Issue #509.
+      if @current_method_name != "" && @current_class_idx >= 0 && @current_method_has_self == 0
+        return "string"
+      end
+      if recv >= 0 && @nd_type[recv] == "SelfNode" && @current_class_idx >= 0 && @current_method_has_self == 0
+        return "string"
+      end
     end
  # hierarchy queries on a Class value.
  # .superclass -> class (the parent or sp_Class{-1})
