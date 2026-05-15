@@ -4620,11 +4620,25 @@ class Compiler
       spec = arg_specs[k]
       ctype = ffi_c_type_of(spec)
  # `:str` forwards the raw `const char *` directly — casting would
- # discard `const` and trigger a warning.
+ # discard `const` and trigger a warning. When the arg's static
+ # type is poly (sp_RbVal), extract `.v.s` (issue #502). The
+ # ternary on infer_type is inlined rather than bound to a local
+ # because adding fresh locals here trips self-host scan_locals;
+ # see feedback_self_host_recursive_fn_arm.
       if spec == "str"
-        result = result + compile_expr(call_args[k])
+        if infer_type(call_args[k]) == "poly"
+          @needs_rb_value = 1
+          result = result + "(" + compile_expr(call_args[k]) + ").v.s"
+        else
+          result = result + compile_expr(call_args[k])
+        end
       elsif spec == "ptr"
-        result = result + "((void *)" + compile_expr(call_args[k]) + ")"
+        if infer_type(call_args[k]) == "poly"
+          @needs_rb_value = 1
+          result = result + "((void *)(" + compile_expr(call_args[k]) + ").v.p)"
+        else
+          result = result + "((void *)" + compile_expr(call_args[k]) + ")"
+        end
       elsif spec == "float_array" || spec == "int_array"
  # Zero-copy bulk transfer (#474). The Spinel Array's contiguous
  # storage lives at `.data`; we hand the raw pointer to C with
@@ -9224,10 +9238,17 @@ class Compiler
   end
 
  # Builds the trailing portion of a call-args list — each non-empty
- # piece prefixed with ", ", empties skipped. Returns "" when both
+ # piece prefixed with ", ", empties skipped. Returns "" when all
  # are empty. Mirrors build_params_str: callers concatenate the
  # result onto a self/recv prefix to form the full arg list.
-  def build_call_tail(ca, bp)
+ #
+ # `yargs` carries the trailing yield ABI args (`_block, _benv`) when
+ # the callee declares `yield` but the call site doesn't pass a
+ # literal block. Without it, methods with both `&block` and `yield`
+ # in their body get a 3-arg call against a 5-arg signature and clang
+ # fails the build. Mirrors the `, NULL, NULL` shape that the
+ # top-level no-recv path appends in compile_no_recv_call_expr.
+  def build_call_tail(ca, bp, yargs = "")
     result = ""
     if ca != ""
       result = result + ", " + ca
@@ -9235,7 +9256,27 @@ class Compiler
     if bp != ""
       result = result + ", " + bp
     end
+    if yargs != ""
+      result = result + yargs
+    end
     result
+  end
+
+ # Returns the trailing yield-ABI args (`, NULL, NULL`) when an
+ # instance method declares `yield` in its body but the call site
+ # doesn't inline (no literal block — those route through
+ # compile_yield_call_stmt and bypass the C call entirely). The
+ # callee's C signature is `..., _block, _benv` whenever
+ # cls_method_has_yield is set; omitting these triggers
+ # "too few arguments to function call" at clang time.
+  def cls_call_yargs(ci, midx)
+    if ci < 0 || midx < 0
+      return ""
+    end
+    if cls_method_has_yield(ci, midx) == 1
+      return ", NULL, NULL"
+    end
+    ""
   end
 
  # ---- Emit top-level methods ----
@@ -12560,6 +12601,11 @@ class Compiler
       end
     end
 
+ # `include` is handled at analyze time; at codegen it returns nil.
+    if mname == "include"
+      return "0"
+    end
+
  # Bare `new` inside a `def self.<m>` body resolves to
  # <CurrentClass>.new. Dispatched here rather than via the
  # later `mname == "new"` branch in compile_call_expr because
@@ -12921,6 +12967,12 @@ class Compiler
             bp = "0"
           end
         end
+ # Pad the trailing `_block, _benv` yield-ABI slots when the callee's
+ # body uses `yield`. The literal-block path (compile_yield_call_stmt)
+ # bypasses this C call entirely by inlining the body, so reaching
+ # here means no literal block at the call site — `NULL, NULL` is
+ # always safe.
+        yargs = cls_call_yargs(owner_ci, owner_midx)
  # When the call resolves through inheritance to an
  # ancestor's method, the C function takes `sp_<owner>
  # *self`. Our `self` here is `sp_<current> *`. Cast so
@@ -12966,7 +13018,7 @@ class Compiler
             if rt_ok == 1 && pt_ok == 1
               tmp = new_temp
               rt_c = c_type(base_rt)
-              default_call = "sp_" + owner + "_" + sanitize_name(mname) + "(" + recv_arg + build_call_tail(ca, bp) + ")"
+              default_call = "sp_" + owner + "_" + sanitize_name(mname) + "(" + recv_arg + build_call_tail(ca, bp, yargs) + ")"
  # Initialize tmp to a type-default so the base call only runs
  # in the default arm — calling it eagerly before the switch
  # would raise from an abstract stub before any subclass arm
@@ -12981,7 +13033,7 @@ class Compiler
                 cand_owner2 = p2[1].to_i
                 cand_name = @cls_names[cand_owner2]
                 cand_recv = "(sp_" + cand_name + " *)" + self_expr
-                cand_call = "sp_" + cand_name + "_" + sanitize_name(mname) + "(" + cand_recv + build_call_tail(ca, bp) + ")"
+                cand_call = "sp_" + cand_name + "_" + sanitize_name(mname) + "(" + cand_recv + build_call_tail(ca, bp, yargs) + ")"
                 emit("    case " + cand_cid.to_s + "LL: " + tmp + " = " + cand_call + "; break;")
                 ol2 = ol2 + 1
               end
@@ -12991,7 +13043,7 @@ class Compiler
             end
           end
         end
-        return "sp_" + owner + "_" + sanitize_name(mname) + "(" + recv_arg + build_call_tail(ca, bp) + ")"
+        return "sp_" + owner + "_" + sanitize_name(mname) + "(" + recv_arg + build_call_tail(ca, bp, yargs) + ")"
       end
  # Check attr_readers (bare method call like `x` meaning self.x)
       readers = @cls_attr_readers[@current_class_idx].split(";")
@@ -14404,9 +14456,16 @@ class Compiler
           if recv >= 0 && @nd_type[recv] == "StringNode" && @nd_content[recv] == "" && @nd_type[a[0]] == "StringNode"
             return "sp_StrArray_new()"
           end
+          if @nd_type[a[0]] == "NilNode"
+            return "sp_str_split_ws(" + rc + ")"
+          end
+          return "sp_str_split(" + rc + ", " + compile_expr(a[0]) + ")"
         end
       end
-      return "sp_str_split(" + rc + ", " + compile_arg0(nid) + ")"
+ # No-arg split (`s.split`) is Ruby's whitespace-split idiom.
+ # Issue #507: prior fallback emitted `sp_str_split(s, 0)` and
+ # crashed at strlen(NULL).
+      return "sp_str_split_ws(" + rc + ")"
     end
     if mname == "lines"
       @needs_str_array = 1
@@ -14492,6 +14551,19 @@ class Compiler
       return "sp_str_index(" + rc + ", " + compile_arg0(nid) + ")"
     end
     if mname == "rindex"
+      args_id_ri = @nd_arguments[nid]
+      if args_id_ri >= 0
+        a_ri = get_args(args_id_ri)
+        if a_ri.length >= 1
+ # `s.rindex(/regex/)` routes through sp_re_rindex; the plain
+ # string variant (sp_str_rindex) would have lowered the regex
+ # pat to `0` and crashed at strlen(NULL). Issue #504.
+          rpat_ri = regex_pat_c_expr(a_ri[0])
+          if rpat_ri != ""
+            return "sp_re_rindex(" + rpat_ri + ", " + rc + ")"
+          end
+        end
+      end
       return "sp_str_rindex(" + rc + ", " + compile_arg0(nid) + ")"
     end
     if mname == "tr"
@@ -14534,11 +14606,14 @@ class Compiler
         a = get_args(args_id)
         if a.length >= 1
           if @nd_type[a[0]] == "RangeNode"
- # s[1..3] inclusive, s[1...3] exclusive
+ # s[1..3] inclusive, s[1...3] exclusive. The `_r` runtime
+ # variants normalize negative endpoints against the string
+ # length first. Issue #496: the prior `right - left + 1`
+ # formula silently produced a negative length for `s[1..-2]`
+ # and returned "".
             left = compile_expr(@nd_left[a[0]])
             right = compile_expr(@nd_right[a[0]])
-            adj = range_excl_end(a[0]) == 1 ? "" : " + 1"
-            return fn + "(" + lprefix + ", " + left + ", " + right + " - " + left + adj + ")"
+            return (use_len ? "sp_str_sub_range_len_r" : "sp_str_sub_range_r") + "(" + lprefix + ", " + left + ", " + right + ", " + (range_excl_end(a[0]) == 1 ? "1" : "0") + ")"
           end
           if a.length >= 2
  # s[0, 2]
@@ -14680,13 +14755,15 @@ class Compiler
       return "((mrb_int)(unsigned char)(" + rc + ")[" + compile_arg0(nid) + "])"
     end
     if mname == "setbyte"
-      args_id = @nd_arguments[nid]
-      if args_id >= 0
-        a = get_args(args_id)
-        if a.length >= 2
-          return "(((char*)" + rc + ")[" + compile_expr(a[0]) + "] = (char)" + compile_expr(a[1]) + ", 0)"
-        end
-      end
+ # `s.setbyte(i, v)` mutates the receiver in place. Spinel
+ # strings are stored as `const char *`, and the canonical
+ # interning path keeps literal strings in read-only memory.
+ # The previous emit cast `rc` to `char *` and wrote through —
+ # for a literal source this SEGVs at the write. Issue #504.
+ # Until proper mutable-string support lands, drop the mutation
+ # and return 0 — the user's downstream read of the modified
+ # string will see the unchanged value, but we don't crash.
+      warn_unresolved_call(mname, "string")
       return "0"
     end
     if mname == "bytesize"
@@ -15610,10 +15687,13 @@ class Compiler
         if args_id >= 0
           a = get_args(args_id)
           if a.length >= 1 && @nd_type[a[0]] == "RangeNode"
+ # Issue #496: sp_IntArray_slice_range normalizes negative
+ # endpoints against the array length before computing slice
+ # length. The prior `right - left + 1` formula silently
+ # produced a negative count for `a[1..-2]`.
             left = compile_expr(@nd_left[a[0]])
             right = compile_expr(@nd_right[a[0]])
-            adj = range_excl_end(a[0]) == 1 ? "" : " + 1"
-            return "sp_IntArray_slice(" + rc + ", " + left + ", " + right + " - " + left + adj + ")"
+            return "sp_IntArray_slice_range(" + rc + ", " + left + ", " + right + ", " + (range_excl_end(a[0]) == 1 ? "1" : "0") + ")"
           end
           if a.length >= 2
             return "sp_IntArray_slice(" + rc + ", " + compile_expr(a[0]) + ", " + compile_expr(a[1]) + ")"
@@ -15790,6 +15870,16 @@ class Compiler
       if mname == "sum"
         return "sp_IntArray_sum(" + rc + ", " + compile_arg0_as_int(nid) + ")"
       end
+ # `arr.reduce(:op)` / `arr.inject(:op)` for arithmetic op
+ # symbols on int_array. Issue #506. Block form is handled at
+ # the generic poly path; here we fold inline for the
+ # symbol-arg shape. Empty array returns 0 (not nil, which
+ # int_array can't carry). Inlined call to reduce_sym_op_for
+ # since adding new locals to this large emit method tripped
+ # self-host scan_locals (see feedback_self_host_recursive_fn_arm).
+      if (mname == "reduce" || mname == "inject") && reduce_sym_op_for(nid) != ""
+        return "({ sp_IntArray *_arr = " + rc + "; mrb_int _acc = _arr->len > 0 ? sp_IntArray_get(_arr, 0) : 0; for (mrb_int _i = 1; _i < _arr->len; _i++) _acc = _acc " + reduce_sym_op_for(nid) + " sp_IntArray_get(_arr, _i); _acc; })"
+      end
       if mname == "to_a"
         return "sp_IntArray_dup(" + rc + ")"
       end
@@ -15921,10 +16011,10 @@ class Compiler
         if args_id >= 0
           a = get_args(args_id)
           if a.length >= 1 && @nd_type[a[0]] == "RangeNode"
+ # Issue #496: see IntArray branch for rationale.
             left = compile_expr(@nd_left[a[0]])
             right = compile_expr(@nd_right[a[0]])
-            adj = range_excl_end(a[0]) == 1 ? "" : " + 1"
-            return "sp_FloatArray_slice(" + rc + ", " + left + ", " + right + " - " + left + adj + ")"
+            return "sp_FloatArray_slice_range(" + rc + ", " + left + ", " + right + ", " + (range_excl_end(a[0]) == 1 ? "1" : "0") + ")"
           end
           if a.length >= 2
             return "sp_FloatArray_slice(" + rc + ", " + compile_expr(a[0]) + ", " + compile_expr(a[1]) + ")"
@@ -16062,10 +16152,10 @@ class Compiler
         if args_id >= 0
           a = get_args(args_id)
           if a.length >= 1 && @nd_type[a[0]] == "RangeNode"
+ # Issue #496: see IntArray branch for rationale.
             left = compile_expr(@nd_left[a[0]])
             right = compile_expr(@nd_right[a[0]])
-            adj = range_excl_end(a[0]) == 1 ? "" : " + 1"
-            return "sp_StrArray_slice(" + rc + ", " + left + ", " + right + " - " + left + adj + ")"
+            return "sp_StrArray_slice_range(" + rc + ", " + left + ", " + right + ", " + (range_excl_end(a[0]) == 1 ? "1" : "0") + ")"
           end
           if a.length >= 2
             return "sp_StrArray_slice(" + rc + ", " + compile_expr(a[0]) + ", " + compile_expr(a[1]) + ")"
@@ -16946,6 +17036,32 @@ class Compiler
       if @nd_block[nid] >= 0
         return compile_reduce_expr(nid)
       end
+    end
+    ""
+  end
+
+ # Returns the C op token ("+", "*", ...) when `nid` is an
+ # `arr.reduce(:op)` / `arr.inject(:op)` call with a single
+ # SymbolNode arg naming an inlinable binary arithmetic /
+ # bitwise op. Else "". Issue #506. Pulled out of the
+ # int_array dispatch so the emit site has no new locals
+ # (the dispatch method is large and adding scope tripped
+ # self-host scan_locals; see feedback_self_host_recursive_fn_arm).
+  def reduce_sym_op_for(nid)
+    args_id = @nd_arguments[nid]
+    if args_id < 0
+      return ""
+    end
+    args = get_args(args_id)
+    if args.length != 1
+      return ""
+    end
+    if @nd_type[args[0]] != "SymbolNode"
+      return ""
+    end
+    op = @nd_content[args[0]]
+    if op == "+" || op == "*" || op == "-" || op == "/" || op == "%" || op == "&" || op == "|" || op == "^"
+      return op
     end
     ""
   end
@@ -17970,7 +18086,12 @@ class Compiler
               bp = "0"
             end
           end
-          tail = build_call_tail(ca, bp)
+ # Pad the trailing `_block, _benv` yield-ABI slots when the callee's
+ # body uses `yield`. The literal-block path inlines via
+ # compile_yield_call_stmt and bypasses this C call entirely, so
+ # reaching here means no literal block at the call site.
+          yargs = cls_call_yargs(oci2, midx2)
+          tail = build_call_tail(ca, bp, yargs)
           if owner == cname
             return "sp_" + owner + "_" + sanitize_name(mname) + "(" + rc + tail + ")"
           else
@@ -18628,7 +18749,17 @@ class Compiler
           str_fn_gs = mname == "gsub" ? "sp_str_gsub" : "sp_str_sub"
           rep_gs = compile_expr(a_gs[1])
           if rpat_gs != ""
-            call_gs = fn_gs + "(" + rpat_gs + ", " + recv_tmp + ".v.s, " + rep_gs + ")"
+ # gsub(regex, hash) on the SP_TAG_STR poly arm. Issue #503:
+ # the typed-receiver path (compile_string_method_expr) routes
+ # str_str_hash replacements through `sp_re_gsub_str_str_hash`;
+ # the poly arm previously fell through to `sp_re_gsub` and
+ # smuggled the hash pointer through where `const char *rep`
+ # is expected. Mirror the typed-receiver branch here.
+            if mname == "gsub" && infer_type(a_gs[1]) == "str_str_hash"
+              call_gs = "sp_re_gsub_str_str_hash(" + rpat_gs + ", " + recv_tmp + ".v.s, " + rep_gs + ")"
+            else
+              call_gs = fn_gs + "(" + rpat_gs + ", " + recv_tmp + ".v.s, " + rep_gs + ")"
+            end
           else
             call_gs = str_fn_gs + "(" + recv_tmp + ".v.s, " + compile_expr(a_gs[0]) + ", " + rep_gs + ")"
           end
@@ -23052,15 +23183,46 @@ class Compiler
       cond = compile_cond_expr(@nd_predicate[nid])
       emit("  } while (" + cond + ");")
     else
+ # Compile the predicate into a scratch buffer so any side-effecting
+ # emits (compile_expr_gc_rooted's `temp = call(); SP_GC_ROOT(temp);`
+ # for a CallNode receiver, etc.) land INSIDE the loop body instead
+ # of once before it. Issue #500: `while (n = gets.to_i) > 0` hoisted
+ # `_t1 = sp_gets(); SP_GC_ROOT(_t1);` ahead of the while, so every
+ # iteration re-read the same captured first line and the loop never
+ # terminated. Capturing the cond's emits and replaying them inside
+ # the loop body — wrapped in `while (1) { ...; if (!cond) break; ... }`
+ # — keeps the receiver call (and its transient root) per-iteration,
+ # so EOF on stdin actually advances `_t1` and the condition flips.
+      saved_out = @out_lines
+      @out_lines = "".split(",")
       cond = compile_cond_expr(@nd_predicate[nid])
-      emit("  while (" + cond + ") {")
-      @indent = @indent + 1
-      redo_label = push_redo_label
-      emit_redo_label(redo_label)
-      compile_stmts_body(@nd_body[nid])
-      pop_redo_label
-      @indent = @indent - 1
-      emit("  }")
+      cond_hoists = @out_lines
+      @out_lines = saved_out
+      if cond_hoists.length > 0
+        emit("  while (1) {")
+        @indent = @indent + 1
+        ch_i = 0
+        while ch_i < cond_hoists.length
+          @out_lines.push(cond_hoists[ch_i])
+          ch_i = ch_i + 1
+        end
+        emit("if (!(" + cond + ")) break;")
+        redo_label = push_redo_label
+        emit_redo_label(redo_label)
+        compile_stmts_body(@nd_body[nid])
+        pop_redo_label
+        @indent = @indent - 1
+        emit("  }")
+      else
+        emit("  while (" + cond + ") {")
+        @indent = @indent + 1
+        redo_label = push_redo_label
+        emit_redo_label(redo_label)
+        compile_stmts_body(@nd_body[nid])
+        pop_redo_label
+        @indent = @indent - 1
+        emit("  }")
+      end
     end
     @hoisted_strlen_var = saved_var
     @hoisted_strlen_recv = saved_recv
@@ -29897,7 +30059,17 @@ class Compiler
     while emitted.length < @current_method_yield_arity
       emitted.push("0")
     end
-    emit("  if (_block) _block(" + emitted.join(", ") + ", _benv);")
+ # When the enclosing method declares `&block`, fall back to invoking the
+ # captured proc if the yield-ABI slot is empty. This matches Ruby semantics
+ # (yield and `block.call` drive the same proc) and lets `&block_arg` call
+ # sites work even when the call emit fills lv_block but leaves _block NULL.
+    if @current_method_block_param != ""
+      bp = "lv_" + @current_method_block_param
+      emit("  if (_block) _block(" + emitted.join(", ") + ", _benv);")
+      emit("  else if (" + bp + ") sp_proc_call(" + bp + ", (mrb_int[]){" + emitted.join(", ") + "});")
+    else
+      emit("  if (_block) _block(" + emitted.join(", ") + ", _benv);")
+    end
   end
 
   def compile_yield_call_stmt(nid, mi)

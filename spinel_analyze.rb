@@ -448,6 +448,13 @@ class Compiler
     @parse_id_cache = {}
     @parse_id_pool = [[0]]
 
+ # Tracks bare names whose @meth_* row was added by
+ # collect_toplevel_module_includes. Entries marked here are
+ # overwriteable by a later top-level `include` (last-include-
+ # wins). User-defined `def <m>` rows aren't marked, so they
+ # win over any subsequent include.
+    @toplevel_include_alias = {}
+
     @needs_stringio = 0
     @proc_counter = 0
     @proc_funcs = ""
@@ -3125,6 +3132,14 @@ class Compiler
         if lt == "mutable_str"
           return "mutable_str"
         end
+ # `string << x` lowers to sp_str_concat which returns a fresh
+ # `const char *`. Without this arm the inference fell back to
+ # `int` and the surrounding `p` / interpolation emitted
+ # `sp_int_to_s(<string-ptr>)` and printed a meaningless integer
+ # (issue #504 send(:<<) follow-up).
+        if lt == "string"
+          return "string"
+        end
  # Array `<<` returns the recv (so `(arr << x) << y` chains).
         if is_array_type(lt) == 1
           return lt
@@ -4542,6 +4557,26 @@ class Compiler
       if args_id >= 0
         aargs = get_args(args_id)
         if aargs.length > 0
+ # `arr.reduce(:op)` / `inject(:op)` (binary-op symbol form):
+ # the result is the array's element type, not the symbol type.
+ # Issue #506: without this arm, `[1,2,3,4].reduce(:*)` typed as
+ # `symbol` and `p`-inspected as `:<sym-name-of-24>` instead of
+ # printing `24`.
+          if aargs.length == 1 && @nd_type[aargs[0]] == "SymbolNode"
+            sop = @nd_content[aargs[0]]
+            if sop == "+" || sop == "*" || sop == "-" || sop == "/" || sop == "%" || sop == "&" || sop == "|" || sop == "^"
+              if recv >= 0
+                rt_inj = infer_type(recv)
+                if rt_inj == "int_array"
+                  return "int"
+                end
+                if rt_inj == "float_array"
+                  return "float"
+                end
+              end
+              return "int"
+            end
+          end
           return infer_type(aargs[0])
         end
       end
@@ -6139,6 +6174,13 @@ class Compiler
       end
     }
 
+ # Top-level `include <Mod>` aliases the module's module_function
+ # methods into @meth_* under their bare names so unprefixed calls
+ # dispatch through the existing find_method_idx path. Later
+ # includes overwrite earlier aliases for the same bare name
+ # (last-include-wins); user-defined top-level `def`s are preserved.
+ # Must run after module-function entries are registered.
+    collect_toplevel_module_includes
  # Pass 2.6: hoist `recv.instance_eval do ... end` blocks into
  # file-scope static functions. Receiver-class flow analysis picks the
  # receiver's class, the block body is later compiled as a function
@@ -8699,74 +8741,112 @@ class Compiler
     "int"
   end
 
+ # Walk root statements for bare `include <Mod>` and alias the
+ # module's `<Mod>_cls_<m>` entries into @meth_* under their
+ # bare names. Skips unregistered modules (e.g. Comparable);
+ # collisions with user-defined top-level defs are preserved
+ # while overlap with prior alias entries is overwritten (see
+ # alias_module_methods_at_toplevel). `Foo.include(M)` is
+ # handled separately by collect_class_with_prefix.
+  def collect_toplevel_module_includes
+    root = @root_id
+    if @nd_type[root] != "ProgramNode"
+      return
+    end
+    stmts = get_body_stmts(root)
+    si = 0
+    while si < stmts.length
+      sid = stmts[si]
+      if @nd_type[sid] == "CallNode" && @nd_receiver[sid] < 0 && @nd_name[sid] == "include"
+        inc_args = @nd_arguments[sid]
+        if inc_args >= 0
+          inc_ids = get_args(inc_args)
+          ik = 0
+          while ik < inc_ids.length
+            inc_t = @nd_type[inc_ids[ik]]
+            if inc_t == "ConstantReadNode" || inc_t == "ConstantPathNode"
+              mod_name = const_ref_flat_name(inc_ids[ik])
+              if mod_name != "" && module_name_exists(mod_name) == 1
+                alias_module_methods_at_toplevel(mod_name)
+              end
+            end
+            ik = ik + 1
+          end
+        end
+      end
+      si = si + 1
+    end
+  end
+
+ # Copy each `<mod_name>_cls_<m>` row in @meth_* to a parallel
+ # bare-name row sharing body_id. On collision: an entry already
+ # marked in @toplevel_include_alias is overwritten in place
+ # (last-include-wins); user-def rows are unmarked and preserved.
+ # A one-shot bare-name → row-index map keeps collision checks O(1).
+  def alias_module_methods_at_toplevel(mod_name)
+    prefix = mod_name + "_cls_"
+    plen = prefix.length
+
+    name_to_idx = {}
+    k = 0
+    while k < @meth_names.length
+      if !name_to_idx.key?(@meth_names[k])
+        name_to_idx[@meth_names[k]] = k
+      end
+      k = k + 1
+    end
+
+    src_count = @meth_names.length
+    si = 0
+    while si < src_count
+      full = @meth_names[si]
+      if full.length > plen && full[0, plen] == prefix
+        bare = full[plen, full.length - plen]
+        existing = -1
+        if name_to_idx.key?(bare)
+          existing = name_to_idx[bare]
+        end
+        if existing < 0
+          @meth_names.push(bare)
+          @meth_param_names.push(@meth_param_names[si])
+          @meth_param_types.push(@meth_param_types[si])
+          @meth_param_empty.push(@meth_param_empty[si])
+          @meth_return_types.push(@meth_return_types[si])
+          @meth_body_ids.push(@meth_body_ids[si])
+          @meth_has_defaults.push(@meth_has_defaults[si])
+          @meth_has_yield.push(@meth_has_yield[si])
+          @meth_rest_index.push(@meth_rest_index[si])
+          @toplevel_include_alias[bare] = 1
+          name_to_idx[bare] = @meth_names.length - 1
+        elsif @toplevel_include_alias.key?(bare)
+          @meth_param_names[existing] = @meth_param_names[si]
+          @meth_param_types[existing] = @meth_param_types[si]
+          @meth_param_empty[existing] = @meth_param_empty[si]
+          @meth_return_types[existing] = @meth_return_types[si]
+          @meth_body_ids[existing] = @meth_body_ids[si]
+          @meth_has_defaults[existing] = @meth_has_defaults[si]
+          @meth_has_yield[existing] = @meth_has_yield[si]
+          @meth_rest_index[existing] = @meth_rest_index[si]
+        end
+      end
+      si = si + 1
+    end
+  end
+
   def collect_toplevel_method(nid)
     mname = @nd_name[nid]
     body_id = @nd_body[nid]
     params_str = collect_params_str(nid)
-    ptypes_str = ""
+ # Use the shared ptypes builder so kwrest (`**kw`) and post-rest
+ # required params (`def f(*r, x, y)`) get slots that match the
+ # names emitted by collect_params_str above. An earlier inline
+ # build here omitted both, leaving param_names.length one (or
+ # more) ahead of param_types.length — the per-method scope build
+ # in infer_function_body_call_types then pushed nil into the
+ # scope_types array for any missing slot, which later tripped
+ # base_type / unify_call_types when a body referenced that local.
+    ptypes_str = collect_ptypes_str(nid, -1)
     defaults_str = collect_defaults_str(nid)
-
- # Infer param types from defaults
-    params = @nd_parameters[nid]
-    if params >= 0
-      reqs = parse_id_list(@nd_requireds[params])
-      opts = parse_id_list(@nd_optionals[params])
-      kws = parse_id_list(@nd_keywords[params])
-      k = 0
-      while k < reqs.length
-        if ptypes_str != ""
-          ptypes_str = ptypes_str + ","
-        end
-        ptypes_str = ptypes_str + "int"
-        k = k + 1
-      end
-      k = 0
-      while k < opts.length
-        if ptypes_str != ""
-          ptypes_str = ptypes_str + ","
-        end
-        def_id = @nd_expression[opts[k]]
-        if def_id >= 0
-          ptypes_str = ptypes_str + infer_type(def_id)
-        else
-          ptypes_str = ptypes_str + "int"
-        end
-        k = k + 1
-      end
-      k = 0
-      while k < kws.length
-        if ptypes_str != ""
-          ptypes_str = ptypes_str + ","
-        end
-        def_id = @nd_expression[kws[k]]
-        if def_id >= 0
-          ptypes_str = ptypes_str + infer_type(def_id)
-        else
-          ptypes_str = ptypes_str + "int"
-        end
-        k = k + 1
-      end
- # Rest param (splat)
-      rest = @nd_rest[params]
-      if rest >= 0
-        if @nd_type[rest] == "RestParameterNode"
-          if ptypes_str != ""
-            ptypes_str = ptypes_str + ","
-          end
-          ptypes_str = ptypes_str + "int_array"
-        end
-      end
- # Block param (&block)
-      blk = @nd_block[params]
-      if blk >= 0
-        if @nd_type[blk] == "BlockParameterNode"
-          if ptypes_str != ""
-            ptypes_str = ptypes_str + ","
-          end
-          ptypes_str = ptypes_str + "proc"
-        end
-      end
-    end
 
     @meth_names.push(mname)
     @meth_param_names.push(params_str)
