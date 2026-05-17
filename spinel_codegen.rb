@@ -9661,6 +9661,13 @@ class Compiler
       yp = yield_params_suffix(mi)
     end
 
+ # Reset @heap_promoted_names at method boundary. The list
+ # tracks fiber-capture heap cells that live in the EMITTING
+ # function's local C scope; leaking it across methods makes
+ # sibling methods see `(*_hcell_<name>_<n>)` references to
+ # cells that exist only in the original method. Issue #564.
+    saved_hp_names_len_mb = @heap_promoted_names.length
+    saved_hp_cells_len_mb = @heap_promoted_cells.length
     if oc_type != ""
  # Open class method: self is primitive type
       rt = @meth_return_types[mi]
@@ -9715,6 +9722,15 @@ class Compiler
 
     rt = @meth_return_types[mi]
     pop_scope
+ # Restore @heap_promoted_names to the pre-method baseline so
+ # the next method doesn't see this method's fiber-capture
+ # cells. Issue #564.
+    while @heap_promoted_names.length > saved_hp_names_len_mb
+      @heap_promoted_names.pop
+    end
+    while @heap_promoted_cells.length > saved_hp_cells_len_mb
+      @heap_promoted_cells.pop
+    end
     @current_method_name = ""
     @current_method_block_param = ""
     @in_yield_method = 0
