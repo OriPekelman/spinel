@@ -3225,6 +3225,18 @@ class Compiler
           return "bigint"
         end
       end
+ # Time comparison. <=> is Integer; the rest are Boolean.
+ # <, >, == etc. also resolve via infer_comparison_type, but
+ # <=> does not — without this Time <=> Time is unresolved and
+ # falls back to emitting 0.
+      if lt == "time"
+        if mname == "<=>"
+          return "int"
+        end
+        if mname == "<" || mname == ">" || mname == "<=" || mname == ">=" || mname == "==" || mname == "!="
+          return "bool"
+        end
+      end
       args_id = @nd_arguments[nid]
       if args_id >= 0
         aargs = parse_id_list(@nd_args[args_id])
@@ -3255,6 +3267,10 @@ class Compiler
         if lt == "complex"
           return "complex"
         end
+ # Time + Numeric — n seconds later, still a Time.
+        if lt == "time"
+          return "time"
+        end
  # Check RHS for float promotion
         args_id = @nd_arguments[nid]
         if args_id >= 0
@@ -3274,8 +3290,17 @@ class Compiler
         if lt == "float"
           return "float"
         end
+ # Time - Time is Float (elapsed seconds); Time - Numeric is a
+ # Time (n seconds earlier). Matches CRuby.
         if lt == "time"
-          return "float"
+          ti_args = @nd_arguments[nid]
+          if ti_args >= 0
+            ti_a = get_args(ti_args)
+            if ti_a.length > 0 && infer_type(ti_a[0]) == "time"
+              return "float"
+            end
+          end
+          return "time"
         end
         if is_typed_array_type(lt)
           return lt
@@ -3685,6 +3710,27 @@ class Compiler
     if mname == "utc"
       if recv >= 0 && infer_type(recv) == "time"
         return "time"
+      end
+    end
+ # Time broken-down accessors / observation. Gated on a Time
+ # receiver so user classes defining same-named methods still
+ # flow through normal resolution. Local Time.new is in scope;
+ # the fixed-offset 7-arg form is a separate Issue.
+    if mname == "year" || mname == "mon" || mname == "month" || mname == "mday" || mname == "day" || mname == "hour" || mname == "min" || mname == "sec" || mname == "wday" || mname == "yday" || mname == "utc_offset" || mname == "gmt_offset" || mname == "gmtoff"
+      if recv >= 0 && infer_type(recv) == "time"
+        return "int"
+      end
+    end
+ # isdst / dst? are predicates: CRuby returns true / false,
+ # not 0 / 1, so they infer as bool (not the int accessor group).
+    if mname == "isdst" || mname == "dst?"
+      if recv >= 0 && infer_type(recv) == "time"
+        return "bool"
+      end
+    end
+    if mname == "zone"
+      if recv >= 0 && infer_type(recv) == "time"
+        return "string"
       end
     end
  # `obj.class` on a statically-typed instance returns
@@ -5143,6 +5189,14 @@ class Compiler
           if rn == "Fiber"
             return "fiber"
           end
+ # Time.new(...) is the value-typed sp_Time, not an obj_ heap
+ # instance. Without this, `.new` falls to "obj_Time" and every
+ # Time local widens to a pointer, breaking the value-type
+ # accessor / inspect dispatch. The fixed-offset 7-arg form is a
+ # separate Issue; codegen rejects it as unresolved.
+          if rn == "Time"
+            return "time"
+          end
           return "obj_" + rn
         end
       end
@@ -5188,6 +5242,9 @@ class Compiler
             return "time"
           end
           if mname == "at"
+            return "time"
+          end
+          if mname == "new"
             return "time"
           end
         end

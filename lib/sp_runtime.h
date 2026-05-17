@@ -154,17 +154,19 @@ static inline sp_Complex sp_complex_conjugate(sp_Complex a){sp_Complex c;c.re=a.
    `is_utc` distinguishes UTC-coerced times (set by
    `Time#utc`) from local-zone times — a presentation-only flag,
    the underlying epoch is the same instant either way. iso8601 /
-   strftime check the flag at format time. C99 compound literals
-   zero-init missing fields, so existing `(sp_Time){sec, nsec}`
-   sites stay valid (default to local zone). */
+   strftime check the flag at format time. Every `(sp_Time){...}`
+   site initializes all three fields explicitly (is_utc=0 for the
+   local-zone constructors); C99 would zero-init a missing field,
+   but spelling it out keeps intent visible and -Wmissing-field-
+   initializers clean. */
 typedef struct { int64_t tv_sec; int32_t tv_nsec; int8_t is_utc; } sp_Time;
 static inline sp_Time sp_time_now(void) {
   struct timespec ts;
   clock_gettime(CLOCK_REALTIME, &ts);
-  return (sp_Time){ ts.tv_sec, (int32_t)ts.tv_nsec };
+  return (sp_Time){ ts.tv_sec, (int32_t)ts.tv_nsec, 0 };
 }
 static inline sp_Time sp_time_at_int(mrb_int sec) {
-  return (sp_Time){ (int64_t)sec, 0 };
+  return (sp_Time){ (int64_t)sec, 0, 0 };
 }
 /* POSIX convention: keep tv_nsec in [0, 1e9). For negative epoch with a
    non-integer fractional part, decrement tv_sec and roll the fraction
@@ -176,7 +178,7 @@ static inline sp_Time sp_time_at_float(mrb_float epoch) {
     sec -= 1;
     frac += 1.0;
   }
-  return (sp_Time){ sec, (int32_t)(frac * 1e9) };
+  return (sp_Time){ sec, (int32_t)(frac * 1e9), 0 };
 }
 
 
@@ -371,6 +373,108 @@ static const char *sp_time_iso8601(sp_Time t) {
 static inline sp_Time sp_time_utc(sp_Time t) {
   t.is_utc = 1;
   return t;
+}
+
+/* ---- Time broken-down accessors / local Time.new / scalar inspect ----
+   sp_time_vtm is the single zone resolver: is_utc selects gmtime vs
+   localtime, and for local times the UTC offset is computed via
+   mktime(gmtime(s))-s (same portable technique as sp_time_iso8601's
+   #414 follow-up; avoids relying on strftime %z which MSVCRT renders
+   as a name). The sp_Time struct is unchanged. */
+static void sp_time_vtm(sp_Time t, struct tm *bd, int32_t *off, char *zbuf) {
+  time_t s = (time_t)t.tv_sec;
+  if (t.is_utc) {
+    struct tm *g = gmtime(&s);
+    if (g) { *bd = *g; } else { memset(bd, 0, sizeof(*bd)); }
+    if (off) *off = 0;
+    if (zbuf) { zbuf[0]='U'; zbuf[1]='T'; zbuf[2]='C'; zbuf[3]=0; }
+  } else {
+    struct tm *l = localtime(&s);
+    if (l) { *bd = *l; } else { memset(bd, 0, sizeof(*bd)); }
+    if (off) {
+      struct tm gm = *gmtime(&s);
+      gm.tm_isdst = -1;
+      *off = (int32_t)(s - (time_t)mktime(&gm));
+    }
+    if (zbuf) {
+      if (strftime(zbuf, 8, "%Z", bd) == 0) zbuf[0] = 0;
+    }
+  }
+}
+
+/* Time.new(y[,mo[,d[,h[,mi[,s]]]]]) — local construction. mktime
+   interprets the broken-down value in the host local zone and resolves
+   DST itself (tm_isdst=-1), matching CRuby's local Time.new. timegm /
+   days-from-civil are intentionally not used. is_utc=0, struct
+   unchanged. The fixed-offset 7-arg form is a separate Issue. */
+static sp_Time sp_time_new(mrb_int y, mrb_int mo, mrb_int d,
+                           mrb_int h, mrb_int mi, mrb_int s) {
+  struct tm tm;
+  memset(&tm, 0, sizeof(tm));
+  tm.tm_year = (int)y - 1900;
+  tm.tm_mon  = (int)mo - 1;
+  tm.tm_mday = (int)d;
+  tm.tm_hour = (int)h;
+  tm.tm_min  = (int)mi;
+  tm.tm_sec  = (int)s;
+  tm.tm_isdst = -1;
+  time_t e = mktime(&tm);
+  return (sp_Time){ (int64_t)e, 0, 0 };
+}
+
+static mrb_int sp_time_year(sp_Time t){struct tm b;sp_time_vtm(t,&b,NULL,NULL);return (mrb_int)(b.tm_year+1900);}
+static mrb_int sp_time_mon(sp_Time t){struct tm b;sp_time_vtm(t,&b,NULL,NULL);return (mrb_int)(b.tm_mon+1);}
+static mrb_int sp_time_mday(sp_Time t){struct tm b;sp_time_vtm(t,&b,NULL,NULL);return (mrb_int)b.tm_mday;}
+static mrb_int sp_time_hour(sp_Time t){struct tm b;sp_time_vtm(t,&b,NULL,NULL);return (mrb_int)b.tm_hour;}
+static mrb_int sp_time_min(sp_Time t){struct tm b;sp_time_vtm(t,&b,NULL,NULL);return (mrb_int)b.tm_min;}
+static mrb_int sp_time_sec(sp_Time t){struct tm b;sp_time_vtm(t,&b,NULL,NULL);return (mrb_int)b.tm_sec;}
+static mrb_int sp_time_wday(sp_Time t){struct tm b;sp_time_vtm(t,&b,NULL,NULL);return (mrb_int)b.tm_wday;}
+static mrb_int sp_time_yday(sp_Time t){struct tm b;sp_time_vtm(t,&b,NULL,NULL);return (mrb_int)(b.tm_yday+1);}
+static mrb_int sp_time_isdst(sp_Time t){struct tm b;sp_time_vtm(t,&b,NULL,NULL);return (mrb_int)(b.tm_isdst>0?1:0);}
+/* Time + Numeric / Time - Numeric. secs may be fractional (CRuby's
+   Numeric includes Float), so split into whole seconds plus a
+   sub-second carry and keep tv_nsec normalized to [0,1e9). is_utc is
+   inherited from the receiver. */
+static sp_Time sp_time_add(sp_Time t, mrb_float secs) {
+  int64_t whole = (int64_t)secs;
+  mrb_float frac = secs - (mrb_float)whole;
+  int64_t ns = (int64_t)t.tv_nsec + (int64_t)(frac * 1e9);
+  int64_t carry = ns / 1000000000;
+  ns -= carry * 1000000000;
+  if (ns < 0) { ns += 1000000000; carry -= 1; }
+  return (sp_Time){ t.tv_sec + whole + carry, (int32_t)ns, t.is_utc };
+}
+static mrb_int sp_time_utc_offset(sp_Time t){int32_t o;struct tm b;sp_time_vtm(t,&b,&o,NULL);return (mrb_int)o;}
+static const char *sp_time_zone(sp_Time t){char z[8];struct tm b;sp_time_vtm(t,&b,NULL,z);return sp_str_dup_external(z);}
+
+/* Scalar Time inspect. CRuby form: local "YYYY-MM-DD HH:MM:SS +0900",
+   UTC "YYYY-MM-DD HH:MM:SS UTC". The poly-box path keeps its own
+   sp_Time_inspect; this value-taking variant is for the scalar
+   p/puts/to_s codegen path that previously fell into the integer
+   printf cast and failed C compilation. */
+static const char *sp_time_inspect_v(sp_Time t) {
+  char buf[40];
+  struct tm b;
+  int32_t off;
+  sp_time_vtm(t, &b, &off, NULL);
+  size_t n = strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &b);
+  if (n == 0) {
+    snprintf(buf, sizeof(buf), "Time(%lld)", (long long)t.tv_sec);
+    return sp_str_dup_external(buf);
+  }
+  if (t.is_utc) {
+    buf[n++]=' '; buf[n++]='U'; buf[n++]='T'; buf[n++]='C'; buf[n]=0;
+  } else {
+    char sign = off >= 0 ? '+' : '-';
+    long a = off < 0 ? -(long)off : (long)off;
+    int oh = (int)(a / 3600);
+    int om = (int)((a / 60) % 60);
+    buf[n++]=' '; buf[n++]=sign;
+    buf[n++]=(char)('0'+oh/10); buf[n++]=(char)('0'+oh%10);
+    buf[n++]=(char)('0'+om/10); buf[n++]=(char)('0'+om%10);
+    buf[n]=0;
+  }
+  return sp_str_dup_external(buf);
 }
 
 #define SP_GC_STACK_MAX 65536

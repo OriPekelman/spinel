@@ -3868,7 +3868,7 @@ class Compiler
       return "((sp_Range){0,0})"
     end
     if t == "time"
-      return "((sp_Time){0,0})"
+      return "((sp_Time){0,0,0})"
     end
     if t == "complex"
       return "((sp_Complex){0,0})"
@@ -13052,6 +13052,56 @@ class Compiler
       if mname == "utc"
         return "sp_time_utc(" + rc + ")"
       end
+ # Time broken-down accessors and zone observation. is_utc is
+ # respected by sp_time_vtm (gmtime vs localtime). Local Time.new
+ # is in scope; the fixed-offset form is a separate Issue.
+      if mname == "year"
+        return "sp_time_year(" + rc + ")"
+      end
+      if mname == "mon" || mname == "month"
+        return "sp_time_mon(" + rc + ")"
+      end
+      if mname == "mday" || mname == "day"
+        return "sp_time_mday(" + rc + ")"
+      end
+      if mname == "hour"
+        return "sp_time_hour(" + rc + ")"
+      end
+      if mname == "min"
+        return "sp_time_min(" + rc + ")"
+      end
+      if mname == "sec"
+        return "sp_time_sec(" + rc + ")"
+      end
+      if mname == "wday"
+        return "sp_time_wday(" + rc + ")"
+      end
+      if mname == "yday"
+        return "sp_time_yday(" + rc + ")"
+      end
+      if mname == "isdst" || mname == "dst?"
+        return "(sp_time_isdst(" + rc + ") != 0)"
+      end
+      if mname == "utc_offset" || mname == "gmt_offset" || mname == "gmtoff"
+        return "sp_time_utc_offset(" + rc + ")"
+      end
+      if mname == "zone"
+        return "sp_time_zone(" + rc + ")"
+      end
+ # Time <=> Time. <, >, ==, +, - resolve via compile_operator_expr;
+ # <=> has no arm there and falls through to here. Total order on
+ # the instant (tv_sec, then tv_nsec), -1 / 0 / 1. Gated on a Time
+ # argument — mixed Time <=> non-Time is out of scope (a separate
+ # Issue would return nil), so it falls through unresolved.
+      if mname == "<=>"
+        cmp_args = @nd_arguments[nid]
+        if cmp_args >= 0
+          cmp_a = get_args(cmp_args)
+          if cmp_a.length > 0 && infer_type(cmp_a[0]) == "time"
+            return time_cmp_expr(rc, compile_expr(cmp_a[0]))
+          end
+        end
+      end
     end
 
  # Complex (value-type sp_Complex)
@@ -14009,6 +14059,14 @@ class Compiler
     parts.push(compile_expr(nid))
   end
 
+ # Total-order compare of two sp_Time values as a statement
+ # expression yielding -1 / 0 / 1 (tv_sec, then tv_nsec). Both
+ # sides are hoisted into temps so a fresh sp_time_now() receiver
+ # is evaluated once. Used by Time's <, >, <=, >=, ==, <=>.
+  def time_cmp_expr(la, lb)
+    "({ sp_Time _a = " + la + "; sp_Time _b = " + lb + "; (_a.tv_sec < _b.tv_sec) ? -1 : (_a.tv_sec > _b.tv_sec) ? 1 : (_a.tv_nsec < _b.tv_nsec) ? -1 : (_a.tv_nsec > _b.tv_nsec) ? 1 : 0; })"
+  end
+
   def compile_operator_expr(nid, mname, recv)
  # Bigint operators
     lt = infer_type(recv)
@@ -14158,6 +14216,12 @@ class Compiler
           return "sp_complex_add(" + compile_expr(recv) + ", " + compile_expr(rhs_id_c) + ")"
         end
       end
+ # Time + Numeric — add n seconds (Float keeps sub-second via
+ # sp_time_add), is_utc inherited. Result is a sp_Time so chained
+ # .iso8601 etc. lower correctly.
+      if lt == "time"
+        return "sp_time_add(" + compile_expr(recv) + ", (mrb_float)(" + compile_arg0(nid) + "))"
+      end
       return "(" + compile_expr(recv) + " + " + compile_arg0_as_int(nid) + ")"
     end
     if mname == "-"
@@ -14182,6 +14246,10 @@ class Compiler
         if infer_type(rhs_id) == "time"
           return "({ sp_Time _a = " + compile_expr(recv) + "; sp_Time _b = " + compile_expr(rhs_id) + "; (mrb_float)(_a.tv_sec - _b.tv_sec) + (mrb_float)(_a.tv_nsec - _b.tv_nsec) / 1e9; })"
         end
+ # Time - Numeric — subtract n seconds (Float keeps sub-second
+ # via sp_time_add), is_utc inherited. Returns a sp_Time (CRuby:
+ # Time - Time is Float, Time - Numeric is Time).
+        return "sp_time_add(" + compile_expr(recv) + ", -(mrb_float)(" + compile_arg0(nid) + "))"
       end
       r = compile_array_setop_expr(nid, recv, "difference", lt)
       if r != ""
@@ -14347,6 +14415,9 @@ class Compiler
         @needs_class_ancestors = 1
         return "sp_class_lt(" + compile_expr(recv) + ", " + compile_arg0(nid) + ")"
       end
+      if lt == "time" && at == "time"
+        return "(" + time_cmp_expr(compile_expr(recv), compile_arg0(nid)) + " < 0)"
+      end
       return "(" + compile_expr(recv) + " < " + compile_arg0(nid) + ")"
     end
     if mname == ">"
@@ -14368,6 +14439,9 @@ class Compiler
         @needs_class_table = 1
         @needs_class_ancestors = 1
         return "sp_class_lt(" + compile_arg0(nid) + ", " + compile_expr(recv) + ")"
+      end
+      if lt == "time" && at == "time"
+        return "(" + time_cmp_expr(compile_expr(recv), compile_arg0(nid)) + " > 0)"
       end
       return "(" + compile_expr(recv) + " > " + compile_arg0(nid) + ")"
     end
@@ -14391,6 +14465,9 @@ class Compiler
         @needs_class_ancestors = 1
         return "sp_class_le(" + compile_expr(recv) + ", " + compile_arg0(nid) + ")"
       end
+      if lt == "time" && at == "time"
+        return "(" + time_cmp_expr(compile_expr(recv), compile_arg0(nid)) + " <= 0)"
+      end
       return "(" + compile_expr(recv) + " <= " + compile_arg0(nid) + ")"
     end
     if mname == ">="
@@ -14412,6 +14489,9 @@ class Compiler
         @needs_class_table = 1
         @needs_class_ancestors = 1
         return "sp_class_le(" + compile_arg0(nid) + ", " + compile_expr(recv) + ")"
+      end
+      if lt == "time" && at == "time"
+        return "(" + time_cmp_expr(compile_expr(recv), compile_arg0(nid)) + " >= 0)"
       end
       return "(" + compile_expr(recv) + " >= " + compile_arg0(nid) + ")"
     end
@@ -18207,6 +18287,31 @@ class Compiler
           end
           return "sp_time_at_int(" + arg_id + ")"
         end
+ # Time.new(y[,mo[,d[,h[,mi[,s]]]]]) — local construction with
+ # compile-time arity resolution (same shape as Time.at). Missing
+ # positions get C-literal defaults; 0 args is the current time.
+ # 7+ args is the fixed-offset form (a separate Issue): this arm
+ # does not emit for it. analyze still types Time.new as "time",
+ # so the call surfaces as an unresolved-call warning and then a
+ # hard C type error — Time.new with an offset is unsupported and
+ # fails to build by design, not silently.
+        if mname == "new"
+          nargs_id = @nd_arguments[nid]
+          na = nargs_id >= 0 ? get_args(nargs_id) : []
+          nn = na.length
+          if nn == 0
+            return "sp_time_now()"
+          end
+          if nn >= 1 && nn <= 6
+            ny = compile_expr(na[0])
+            nmo = nn >= 2 ? compile_expr(na[1]) : "1"
+            nd = nn >= 3 ? compile_expr(na[2]) : "1"
+            nh = nn >= 4 ? compile_expr(na[3]) : "0"
+            nmi = nn >= 5 ? compile_expr(na[4]) : "0"
+            ns = nn >= 6 ? compile_expr(na[5]) : "0"
+            return "sp_time_new(" + ny + ", " + nmo + ", " + nd + ", " + nh + ", " + nmi + ", " + ns + ")"
+          end
+        end
       end
  # Complex.polar(magnitude, angle) — value-type Cartesian
  # Complex (sp_Complex). Used in optcarrot's nestopia palette
@@ -20631,6 +20736,17 @@ class Compiler
         return "sp_class_eq(" + lc_cls + ", " + rc_cls + ")"
       end
       return "(!sp_class_eq(" + lc_cls + ", " + rc_cls + "))"
+    end
+ # Time == Time / != — equal instant (tv_sec and tv_nsec). Plain
+ # `==` on the struct isn't valid C. Same-instant times compare
+ # equal regardless of the is_utc presentation flag.
+    if lt == "time" && at == "time"
+      le_t = compile_expr(recv)
+      re_t = arg_id >= 0 ? compile_expr(arg_id) : "((sp_Time){0,0,0})"
+      if op == "=="
+        return "(" + time_cmp_expr(le_t, re_t) + " == 0)"
+      end
+      return "(" + time_cmp_expr(le_t, re_t) + " != 0)"
     end
  # Cross-type prim-vs-obj. Integer#== / Float#== fall back to
  # `other == self` via num_equal (numeric.c); String, Symbol,
@@ -28806,6 +28922,9 @@ class Compiler
       @needs_sym_int_hash = 1
       return "sp_SymIntHash_inspect(" + val + ")"
     end
+    if at == "time"
+      return "sp_time_inspect_v(" + val + ")"
+    end
     ""
   end
 
@@ -28866,6 +28985,10 @@ class Compiler
       emit("  { const char *_ps = (const char *)(" + val + "); if (_ps) { fputs(_ps, stdout); if (!*_ps || _ps[strlen(_ps)-1] != '" + bsl_n + "') putchar('" + bsl_n + "'); } else putchar('" + bsl_n + "'); }")
       return
     end
+    if at == "time"
+      emit("  { const char *_ts = sp_time_inspect_v(" + val + "); fputs(_ts, stdout); putchar('" + bsl_n + "'); }")
+      return
+    end
     emit("  printf(\"%lld" + bsl_n + "\", (long long)" + val + ");")
   end
 
@@ -28904,6 +29027,11 @@ class Compiler
       end
       if at == "symbol"
         emit("  puts(sp_sym_to_s(" + val + "));")
+        k = k + 1
+        next
+      end
+      if at == "time"
+        emit("  { const char *_ts = sp_time_inspect_v(" + val + "); fputs(_ts, stdout); putchar('" + bsl_n + "'); }")
         k = k + 1
         next
       end
