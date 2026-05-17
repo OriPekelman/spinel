@@ -1767,6 +1767,7 @@ static const char *sp_file_basename(const char *path) {
    null-termination and stops at the first 0x00 byte — wrong for
    binary data (e.g. .nes ROM files). */
 static sp_IntArray *sp_file_binread_bytes(const char *path) {
+  if (sp_file_directory(path)) sp_raise_cls("Errno::EISDIR", sp_sprintf("Is a directory @ io_fread - %s", path));
   FILE *f = fopen(path, "rb");
   sp_IntArray *a = sp_IntArray_new();
   if (!f) return a;
