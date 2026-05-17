@@ -228,7 +228,10 @@ library -- only included when used.
 
 **Fiber**: Cooperative concurrency via `ucontext_t`. `Fiber.new`,
 `Fiber#resume`, `Fiber.yield` with value passing. Captures free
-variables via heap-promoted cells.
+variables via heap-promoted cells. Per-fiber storage via `Fiber[:k]`
+/ `Fiber[:k] = v` (and the `Fiber.current[:k]` aliases) — symbol-keyed
+poly-valued, lazily allocated, shallow-snapshot inherited from the
+parent at `Fiber.new` time.
 
 **Memory**: Mark-and-sweep GC with size-segregated free lists, non-recursive
 marking, and sticky mark bits. Small classes (≤8 scalar fields, no

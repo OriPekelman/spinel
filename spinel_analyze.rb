@@ -2943,6 +2943,23 @@ class Compiler
         end
       end
     end
+ # Fiber[:k] / Fiber.current[:k] / fiber[:k] — per-fiber storage
+ # read. Returns poly (sp_RbVal) since storage values are
+ # arbitrary Ruby objects, matching MRI's Hash[Symbol, Object]
+ # surface (narrowed in spinel to symbol keys + poly values via
+ # sym_poly_hash). Placed right after the lambda `[]` arm so this
+ # pre-empts the later constant-recv / name-based dispatches that
+ # would default `Fiber[:k]` to int.
+    if mname == "[]" && recv >= 0
+      rcname = constructor_class_name(recv)
+      if rcname == "Fiber"
+        return "poly"
+      end
+      rt2 = base_type(infer_type(recv))
+      if rt2 == "fiber"
+        return "poly"
+      end
+    end
 
  # `method(:foo)` produces a heap-allocated Method (the synthetic
  # class registered in register_builtin_classes). Two captured

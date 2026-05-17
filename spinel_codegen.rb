@@ -12748,6 +12748,28 @@ class Compiler
         return "sp_fiber_current"
       end
     end
+ # Fiber[:k] / Fiber.current[:k] — per-fiber storage read. Matches
+ # MRI's Fiber[] indexing on the storage Hash; returns nil for
+ # unset keys (also when the storage Hash hasn't been allocated
+ # yet, which is the lazy-init lower bound).
+    if mname == "[]" && recv >= 0
+      fiber_recv = ""
+      if constructor_class_name(recv) == "Fiber"
+        @needs_fiber = 1
+        fiber_recv = "sp_fiber_current"
+      elsif base_type(infer_type(recv)) == "fiber"
+        fiber_recv = "(sp_Fiber *)(" + compile_expr_gc_rooted(recv) + ")"
+      end
+      if fiber_recv != ""
+        args_id = @nd_arguments[nid]
+        if args_id >= 0
+          arg_ids = get_args(args_id)
+          if arg_ids.length == 1
+            return "sp_Fiber_storage_get(" + fiber_recv + ", " + compile_expr(arg_ids[0]) + ")"
+          end
+        end
+      end
+    end
 
  # regex.match? / regex.match / regex =~ str — receiver is the regex
  # (typically a constant referring to a /…/ literal). Dispatched here
@@ -25691,6 +25713,26 @@ class Compiler
  # []=
     if mname == "[]="
       if recv >= 0
+ # Fiber[:k] = v / Fiber.current[:k] = v — per-fiber storage write.
+ # Lazily allocates the storage Hash on first write (matches MRI's
+ # lazy-init for fibers that never touch storage).
+        fiber_recv = ""
+        if constructor_class_name(recv) == "Fiber"
+          @needs_fiber = 1
+          fiber_recv = "sp_fiber_current"
+        elsif base_type(infer_type(recv)) == "fiber"
+          fiber_recv = "(sp_Fiber *)(" + compile_expr_gc_rooted(recv) + ")"
+        end
+        if fiber_recv != ""
+          args_id = @nd_arguments[nid]
+          if args_id >= 0
+            arg_ids = get_args(args_id)
+            if arg_ids.length == 2
+              emit("  sp_Fiber_storage_set(" + fiber_recv + ", " + compile_expr(arg_ids[0]) + ", " + box_expr_to_poly(arg_ids[1]) + ");")
+              return 1
+            end
+          end
+        end
         compile_bracket_assign(nid)
         return 1
       end
