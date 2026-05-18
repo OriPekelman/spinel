@@ -495,6 +495,11 @@ class Compiler
  # pairs to avoid duplicate definitions.
     @cls_method_adapters = "".split(",")
 
+ # Snapshot slot/expr pair for the kwargs-as-bundle path in
+ # compile_typed_call_args.
+    @typed_call_bundle_slot = -1
+    @typed_call_bundle_expr = ""
+
  # Proc closure support (Phase 2)
     @in_proc_body = 0
     @proc_captures = "".split(",")
@@ -568,6 +573,13 @@ class Compiler
     @lambda_captures = "".split(",")
     @lambda_insert_pos = 0
     @cls_method_adapters = "".split(",")
+
+ # Snapshot slot/expr pair for the kwargs-as-bundle path in
+ # compile_typed_call_args. Set per-invocation; copied into
+ # locals before the slot-fill loop so nested re-entries don't
+ # clobber the outer pending bundle.
+    @typed_call_bundle_slot = -1
+    @typed_call_bundle_expr = ""
 
  # Proc closure support (Phase 2)
     @in_proc_body = 0
@@ -18861,6 +18873,7 @@ class Compiler
             end
             kw_names_cm = "".split(",")
             kw_vals_cm = "".split(",")
+            kw_arg_ids_cm = []
             positional_cm = []
             ak_cm = 0
             while ak_cm < arg_ids_cm2.length
@@ -18873,6 +18886,7 @@ class Compiler
                     if key_id_cm >= 0 && @nd_type[key_id_cm] == "SymbolNode"
                       kw_names_cm.push(@nd_content[key_id_cm])
                       kw_vals_cm.push(compile_expr(@nd_expression[elems_cm[ek_cm]]))
+                      kw_arg_ids_cm.push(@nd_expression[elems_cm[ek_cm]])
                     end
                   end
                   ek_cm = ek_cm + 1
@@ -18882,6 +18896,26 @@ class Compiler
               end
               ak_cm = ak_cm + 1
             end
+ # Track which kwargs land on a named param slot; the leftovers
+ # bundle into the first hash-typed positional slot below.
+            kw_matched_cm = []
+            kmci = 0
+            while kmci < kw_names_cm.length
+              kw_matched_cm.push(0)
+              kmci = kmci + 1
+            end
+            pkn = 0
+            while pkn < owner_pn.length
+              kki = 0
+              while kki < kw_names_cm.length
+                if kw_names_cm[kki] == owner_pn[pkn]
+                  kw_matched_cm[kki] = 1
+                end
+                kki = kki + 1
+              end
+              pkn = pkn + 1
+            end
+            bundle_emitted_cm = 0
             pos_idx_cm = 0
             kk = 0
             while kk < owner_pn.length
@@ -18899,6 +18933,42 @@ class Compiler
                     ki_cm = kw_names_cm.length
                   else
                     ki_cm = ki_cm + 1
+                  end
+                end
+ # Bundle-as-positional: when no positional/kwarg fills this
+ # slot and the slot's ptype is a hash type, pack any unmatched
+ # kwargs into a fresh sp_StrPolyHash and pass it here. Mirrors
+ # the analyzer-side `widen_ptypes_from_args` fallback that
+ # widens `attrs = {}` to str_poly_hash at the call site.
+                if slot_expr_cm == "" && bundle_emitted_cm == 0
+                  slot_pt_cm = ""
+                  if kk < owner_pt.length
+                    slot_pt_cm = base_type(owner_pt[kk])
+                  end
+                  if is_hash_type(slot_pt_cm) == 1
+                    have_unmatched_cm = 0
+                    chi = 0
+                    while chi < kw_names_cm.length
+                      if kw_matched_cm[chi] == 0
+                        have_unmatched_cm = 1
+                      end
+                      chi = chi + 1
+                    end
+                    if have_unmatched_cm == 1
+                      bundle_tmp_cm = new_temp
+                      @needs_rb_value = 1
+                      emit("  sp_StrPolyHash *" + bundle_tmp_cm + " = sp_StrPolyHash_new();")
+                      bbi = 0
+                      while bbi < kw_names_cm.length
+                        if kw_matched_cm[bbi] == 0
+                          key_c_cm = "(&(\"\\xff\" \"" + kw_names_cm[bbi] + "\")[1])"
+                          emit("  sp_StrPolyHash_set(" + bundle_tmp_cm + ", " + key_c_cm + ", " + box_expr_to_poly(kw_arg_ids_cm[bbi]) + ");")
+                        end
+                        bbi = bbi + 1
+                      end
+                      slot_expr_cm = bundle_tmp_cm
+                      bundle_emitted_cm = 1
+                    end
                   end
                 end
                 if slot_expr_cm == ""
@@ -22749,6 +22819,12 @@ class Compiler
  # the matched kwarg's value-id into arg_ids[slot] so the loop's
  # positional path picks it up. Same effect as
  # compile_call_args_with_defaults's kwarg routing.
+    kw_matched = []
+    kmi = 0
+    while kmi < kw_name_keys.length
+      kw_matched.push(0)
+      kmi = kmi + 1
+    end
     if kw_name_keys.length > 0
       pkk = 0
       while pkk < pnames_t.length
@@ -22759,11 +22835,78 @@ class Compiler
               arg_ids.push(-1)
             end
             arg_ids[pkk] = kw_name_to_arg[kwi].to_i
+            kw_matched[kwi] = 1
           end
           kwi = kwi + 1
         end
         pkk = pkk + 1
       end
+    end
+ # Bundle-as-positional: any kwarg that didn't match a param name
+ # gets packed into the next available hash-typed positional slot.
+ # The analyzer widens that slot to `str_poly_hash` via
+ # widen_ptypes_from_args's fallback , so we synthesize a
+ # sp_StrPolyHash literal here to match. Without this, the call
+ # `Comment.create(article_id: 1, body: "...")` against
+ # `def self.create(attrs = {})` dropped every kwarg and emitted
+ # `sp_Comment_cls_create(sp_StrIntHash_new())` (empty), so the
+ # constructor saw an empty attrs hash and built a Comment with
+ # all defaults.
+    if kw_name_keys.length > 0
+      unmatched_kw_idxs = []
+      uki = 0
+      while uki < kw_name_keys.length
+        if kw_matched[uki] == 0
+          unmatched_kw_idxs.push(uki)
+        end
+        uki = uki + 1
+      end
+      if unmatched_kw_idxs.length > 0
+        target_slot = -1
+        psl = 0
+        while psl < ptypes.length
+          pt_sl = base_type(ptypes[psl])
+          slot_filled = 0
+          if psl < arg_ids.length && arg_ids[psl] >= 0
+            slot_filled = 1
+          end
+          if slot_filled == 0 && is_hash_type(pt_sl) == 1 && target_slot < 0
+            target_slot = psl
+          end
+          psl = psl + 1
+        end
+        if target_slot >= 0
+          bundle_tmp = new_temp
+          @needs_rb_value = 1
+          emit("  sp_StrPolyHash *" + bundle_tmp + " = sp_StrPolyHash_new();")
+          ubi = 0
+          while ubi < unmatched_kw_idxs.length
+            uk = unmatched_kw_idxs[ubi]
+            key_c_b = "(&(\"\\xff\" \"" + kw_name_keys[uk] + "\")[1])"
+            val_id_b = kw_name_to_arg[uk].to_i
+            emit("  sp_StrPolyHash_set(" + bundle_tmp + ", " + key_c_b + ", " + box_expr_to_poly(val_id_b) + ");")
+            ubi = ubi + 1
+          end
+          while arg_ids.length <= target_slot
+            arg_ids.push(-1)
+          end
+ # Mark the slot with a synthetic id pointing at the bundle local.
+ # The loop below special-cases this via a string compare on the
+ # generated C expression, but simpler: drop the bundle string
+ # straight into result via a side-channel map keyed by slot.
+          @typed_call_bundle_slot = target_slot
+          @typed_call_bundle_expr = bundle_tmp
+        else
+          @typed_call_bundle_slot = -1
+          @typed_call_bundle_expr = ""
+        end
+      else
+        @typed_call_bundle_slot = -1
+        @typed_call_bundle_expr = ""
+      end
+    else
+      @typed_call_bundle_slot = -1
+      @typed_call_bundle_expr = ""
     end
     total = ptypes.length
     if arg_ids.length > total
@@ -22799,12 +22942,26 @@ class Compiler
         gk = gk - 1
       end
     end
+ # Snapshot the bundle slot/local before the per-slot loop —
+ # nested compile_expr calls (e.g. a kwarg value that's itself a
+ # method call) will recursively re-enter compile_typed_call_args
+ # and rewrite the ivars. Copying them into locals here keeps the
+ # outer call's bundle reachable from the slot-fill arm.
+    bundle_slot_l = @typed_call_bundle_slot
+    bundle_expr_l = @typed_call_bundle_expr
     result = ""
     pcname = ""
     k = 0
     while k < total
       if k > 0
         result = result + ", "
+      end
+ # Bundle slot: emit the pre-built sp_StrPolyHash local
+ # synthesized from the unmatched kwargs above.
+      if bundle_slot_l == k && bundle_expr_l != ""
+        result = result + bundle_expr_l
+        k = k + 1
+        next
       end
       if k < arg_ids.length && arg_ids[k] >= 0
         at = infer_type(arg_ids[k])

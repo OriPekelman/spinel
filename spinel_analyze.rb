@@ -11025,9 +11025,18 @@ class Compiler
  # body's `attrs[...]` accesses then resolve through the
  # str_poly_hash poly-recv dispatch instead of the unresolved
  # "[] on int" fallback.
+ #
+ # Also fires when the slot is already a narrow hash type from a
+ # `attrs = {}` default — `def self.create(attrs = {})` infers
+ # `attrs` as `str_int_hash` from the literal default. A
+ # `Class.create(article_id: 1, body: "...")` call site has
+ # mixed-type values that don't fit str_int_hash; widen so the
+ # codegen bundle emits sp_StrPolyHash_set with boxed values.
         if any_matched == 0 && pos_idx < ptypes.length
-          if ptypes[pos_idx] == "int" || ptypes[pos_idx] == "nil"
+          pt_w = ptypes[pos_idx]
+          if pt_w == "int" || pt_w == "nil" || is_hash_type(pt_w) == 1
             @needs_rb_value = 1
+            @needs_str_poly_hash = 1
             ptypes[pos_idx] = "str_poly_hash"
           end
           pos_idx = pos_idx + 1
