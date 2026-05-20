@@ -15670,6 +15670,20 @@ class Compiler
             emit("  { mrb_int _n = " + compile_expr(aargs.first) + "; mrb_int _v = " + compile_expr(aargs[1]) + "; for (mrb_int _i = 0; _i < _n; _i++) sp_IntArray_push(" + tmp + ", _v); }")
             return tmp
           end
+ # `Array.new(n)` (single arg, no fill value) creates an array of
+ # n nils in CRuby. The empty-IntArray lowering produced an array
+ # of length 0, so a subsequent `Array.new(3) == [nil, nil, nil]`
+ # compared `[]` against the RHS and surfaced false. Issue #619
+ # puzzle 4. Lowering matches the `Array.new(n, nil)` arm above
+ # since that's the actual CRuby semantic.
+          if aargs.length == 1 && @nd_block[nid] < 0
+            @needs_gc = 1
+            @needs_rb_value = 1
+            tmp = new_temp
+            emit("  sp_PolyArray *" + tmp + " = sp_PolyArray_new();")
+            emit("  { mrb_int _n = " + compile_expr(aargs.first) + "; for (mrb_int _i = 0; _i < _n; _i++) sp_PolyArray_push(" + tmp + ", sp_box_nil()); }")
+            return tmp
+          end
         end
         @needs_int_array = 1
         return "sp_IntArray_new()"

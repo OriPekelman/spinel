@@ -5561,6 +5561,15 @@ class Compiler
                   return vt + "_ptr_array"
                 end
               end
+ # `Array.new(n)` (single arg, no fill value, no block) is CRuby
+ # shorthand for `Array.new(n, nil)`, so the result is a
+ # poly_array of n nils. Mirrors the codegen arm. Issue #619
+ # puzzle 4.
+              if aargs.length == 1 && @nd_block[nid] < 0
+                @needs_rb_value = 1
+                @needs_gc = 1
+                return "poly_array"
+              end
             end
             return "int_array"
           end
@@ -9797,6 +9806,12 @@ class Compiler
                     @needs_gc = 1
                     return vt + "_ptr_array"
                   end
+                end
+ # `Array.new(n)` (single arg) -> n nils. Issue #619 puzzle 4.
+                if aargs.length == 1 && @nd_block[nid] < 0
+                  @needs_rb_value = 1
+                  @needs_gc = 1
+                  return "poly_array"
                 end
               end
               return "int_array"
