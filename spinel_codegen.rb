@@ -15371,7 +15371,11 @@ class Compiler
         arg_ids_p7 = get_args(@nd_arguments[nid])
         if arg_ids_p7.length > 0
           arg_t_p7 = infer_type(arg_ids_p7[0])
-          if arg_t_p7 != "int" && arg_t_p7 != "bool" && arg_t_p7 != "nil"
+ # `nil` lifts too: `[1, 2] << nil` should yield `[1, 2, nil]`,
+ # not int_array of [1, 2, 0]. The nil-tag distinction matters
+ # for the surrounding `==` comparison against the
+ # poly_array RHS literal.
+          if arg_t_p7 != "int" && arg_t_p7 != "bool"
             @needs_rb_value = 1
             @needs_gc = 1
             elems_p7 = parse_id_list(@nd_elements[recv])
@@ -15786,6 +15790,16 @@ class Compiler
       if cname == "Object"
         @needs_gc = 1
         return "sp_Object_new()"
+      end
+ # Modules can't be instantiated; a `module M; def self.new ...`
+ # is a user-defined class method, not a constructor. Fall back
+ # to the normal CallNode dispatch so the actual cls method runs
+ # and the declared return type takes effect. Without this, the
+ # call site emitted sp_box_obj(<result>, <module_cls_id>) and
+ # mis-boxed the return as if it were an instance of the module.
+ # Issue #625.
+      if module_name_exists(cname) == 1
+        return ""
       end
       ci = find_class_idx(cname)
       if ci >= 0

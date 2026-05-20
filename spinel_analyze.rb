@@ -3683,7 +3683,7 @@ class Compiler
             aa_p7 = get_args(args_id_p7)
             if aa_p7.length > 0
               at_p7 = infer_type(aa_p7[0])
-              if at_p7 != "int" && at_p7 != "bool" && at_p7 != "nil"
+              if at_p7 != "int" && at_p7 != "bool"
                 @needs_rb_value = 1
                 @needs_gc = 1
                 return "poly_array"
@@ -5675,6 +5675,13 @@ class Compiler
               return "int"
             end
           end
+ # Modules can't be instantiated; `module M; def self.new ...`
+ # is a user-defined class method. Don't lift to obj_<mod>;
+ # the regular class-method dispatch picks up the declared
+ # return type. Issue #625.
+          if module_name_exists(rn) == 1
+            return ""
+          end
           return "obj_" + rn
         end
       end
@@ -5784,7 +5791,12 @@ class Compiler
         end
         ci2 = find_class_idx(rcname)
         if ci2 >= 0
-          if mname == "new"
+ # Modules can't be instantiated; `module M; def self.new ...`
+ # is a user-defined class method, not a constructor. Skip the
+ # `obj_<mod>` widening so the call resolves through the regular
+ # class-method dispatch below (which honors the declared
+ # return type). Issue #625.
+          if mname == "new" && module_name_exists(rcname) == 0
             return "obj_" + rcname
           end
  # `Klass.method(:cls_meth)` — bind to a class method.
@@ -9865,6 +9877,13 @@ class Compiler
             end
             if rname == "Fiber"
               return "fiber"
+            end
+ # Modules can't be instantiated; `module M; def self.new ...`
+ # is a user-defined class method. Don't lift to obj_<mod>;
+ # the class-method-dispatch inference picks up the declared
+ # return type. Issue #625.
+            if module_name_exists(rname) == 1
+              return ""
             end
             return "obj_" + rname
           end
