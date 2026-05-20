@@ -287,16 +287,37 @@ regexp: $(SP_RT_LIB)
 
 codegen: spinel_analyze$(EXE) spinel_codegen$(EXE)
 
-spinel_analyze$(EXE): $(ANALYZE_STAMP) $(NODE_TABLE_LOADER_STAMP) $(COMPILER_HELPERS_STAMP) spinel_parse$(EXE)
+# Round 1 pipeline split into per-stage rules. Previously the
+# `spinel_<phase>$(EXE)` recipe produced its AST/IR/C1 outputs as
+# side effects, which left those files without proper Make rules.
+# Under parallel make that races: `build/codegen2.ir` (declared to
+# depend on `build/codegen.ast`) could be scheduled before the
+# spinel_codegen recipe had refreshed the AST, so it read a stale
+# AST while later steps used the fresh one. The bid mismatch then
+# corrupted scope tables in the bootstrap fixpoint output. See #620.
+
+build/analyze.ast: $(ANALYZE_STAMP) spinel_parse$(EXE)
 	./spinel_parse$(EXE) spinel_analyze.rb build/analyze.ast
+
+build/codegen.ast: $(CODEGEN_STAMP) spinel_parse$(EXE)
+	./spinel_parse$(EXE) spinel_codegen.rb build/codegen.ast
+
+build/analyze.ir: build/analyze.ast $(ANALYZE_STAMP) $(NODE_TABLE_LOADER_STAMP) $(COMPILER_HELPERS_STAMP)
 	ruby spinel_analyze.rb build/analyze.ast build/analyze.ir
+
+build/codegen.ir: build/codegen.ast $(ANALYZE_STAMP) $(NODE_TABLE_LOADER_STAMP) $(COMPILER_HELPERS_STAMP)
+	ruby spinel_analyze.rb build/codegen.ast build/codegen.ir
+
+build/analyze1.c: build/analyze.ast build/analyze.ir $(CODEGEN_STAMP) $(NODE_TABLE_LOADER_STAMP) $(COMPILER_HELPERS_STAMP)
 	ruby spinel_codegen.rb build/analyze.ast build/analyze.ir build/analyze1.c
+
+build/codegen1.c: build/codegen.ast build/codegen.ir $(CODEGEN_STAMP) $(NODE_TABLE_LOADER_STAMP) $(COMPILER_HELPERS_STAMP)
+	ruby spinel_codegen.rb build/codegen.ast build/codegen.ir build/codegen1.c
+
+spinel_analyze$(EXE): build/analyze1.c $(SP_RT_LIB)
 	$(CC) $(BOOTSTRAP_CFLAGS) -Ilib build/analyze1.c $(LDFLAGS) -lm -o spinel_analyze$(EXE)
 
-spinel_codegen$(EXE): $(CODEGEN_STAMP) $(NODE_TABLE_LOADER_STAMP) $(COMPILER_HELPERS_STAMP) spinel_parse$(EXE)
-	./spinel_parse$(EXE) spinel_codegen.rb build/codegen.ast
-	ruby spinel_analyze.rb build/codegen.ast build/codegen.ir
-	ruby spinel_codegen.rb build/codegen.ast build/codegen.ir build/codegen1.c
+spinel_codegen$(EXE): build/codegen1.c $(SP_RT_LIB)
 	$(CC) $(BOOTSTRAP_CFLAGS) -Ilib build/codegen1.c $(LDFLAGS) -lm -o spinel_codegen$(EXE)
 
 # ---- Self-hosting verification ----
