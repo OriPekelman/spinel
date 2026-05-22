@@ -305,6 +305,14 @@ class Compiler
     @cvar_init_values = "".split(",")
     @const_expr_ids = []
     @const_scope_names = "".split(",")
+ # Parallel to @const_names: when const `<X>`'s init RHS is the
+ # canonical `<Class>.new(...)` shape, record `<Class>` here so
+ # codegen can emit the per-const in-progress flag + read-side
+ # guard that prevents the segfault from reading the partially-
+ # initialized slot during the same RHS evaluation. Empty string
+ # means "no guard needed" (other init shape — literal, helper-
+ # built, etc.). Issue #646.
+    @const_init_class = "".split(",")
 
  # `redo` -- labeled-goto target stack. Each loop emitter pushes
  # a fresh label name when entering an iteration body and pops on
@@ -14489,6 +14497,36 @@ class Compiler
     return ""
   end
 
+ # Issue #646: scan each const's init RHS for the `<Class>.new(...)`
+ # shape. Codegen consumes @const_init_class[ci] (class name or "")
+ # to decide whether to emit a per-const in-progress flag and a
+ # read-side NameError guard. Only the direct shape is detected
+ # here; transitive (`<X> = build_app()` where build_app calls
+ # App.new internally) would need call-graph analysis and is left
+ # to a follow-up.
+  def detect_const_init_classes
+    @const_init_class = "".split(",")
+    i = 0
+    while i < @const_expr_ids.length
+      cls_name_cic = ""
+      eid_cic = @const_expr_ids[i]
+      if eid_cic >= 0 && @nd_type[eid_cic] == "CallNode" && @nd_name[eid_cic] == "new"
+        recv_cic = @nd_receiver[eid_cic]
+        if recv_cic >= 0 && @nd_type[recv_cic] == "ConstantReadNode"
+          cls_name_cic = @nd_name[recv_cic]
+ # Only treat as guard target when the class actually exists --
+ # otherwise the `new` call would have been caught by the
+ # existing unresolved-const path.
+          if find_class_idx(cls_name_cic) < 0
+            cls_name_cic = ""
+          end
+        end
+      end
+      @const_init_class.push(cls_name_cic)
+      i = i + 1
+    end
+  end
+
   def infer_proc_blk_param_types
     @meth_blk_param_types = "".split(",")
     mi = 0
@@ -21629,6 +21667,11 @@ class Compiler
  # already ran inside arbitrate_rbs_vs_inferred_methods.
     arbitrate_rbs_method_params_definite_conflict
     infer_proc_blk_param_types
+ # Issue #646: classify each top-level const init by whether the
+ # RHS is `<Class>.new(...)`. Codegen guards reads of those
+ # consts during their own RHS evaluation to raise NameError
+ # instead of segfaulting on the partially-init slot.
+    detect_const_init_classes
     if ENV["SP_POLY_REPORT"] == "1"
       emit_poly_report
     end
@@ -26911,6 +26954,7 @@ class Compiler
     buf = ir_emit_sa(buf, "@const_types", @const_types)
     buf = ir_emit_ia(buf, "@const_expr_ids", @const_expr_ids)
     buf = ir_emit_sa(buf, "@const_scope_names", @const_scope_names)
+    buf = ir_emit_sa(buf, "@const_init_class", @const_init_class)
     buf = ir_emit_sa(buf, "@cvar_names", @cvar_names)
     buf = ir_emit_sa(buf, "@cvar_types", @cvar_types)
     buf = ir_emit_sa(buf, "@cvar_init_values", @cvar_init_values)

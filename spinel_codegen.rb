@@ -334,6 +334,9 @@ class Compiler
     @cvar_init_values = "".split(",")
     @const_expr_ids = []
     @const_scope_names = "".split(",")
+ # See spinel_analyze.rb's @const_init_class for the schema.
+ # Issue #646.
+    @const_init_class = "".split(",")
 
  # `redo` -- labeled-goto target stack. Each loop emitter pushes
  # a fresh label name when entering an iteration body and pops on
@@ -8016,6 +8019,13 @@ class Compiler
       else
         emit_raw("static " + ctp + " cst_" + @const_names[i] + " = " + c_default_val(@const_types[i]) + ";")
       end
+ # Issue #646: per-const in-progress flag for consts whose init
+ # RHS is `<Class>.new(...)`. Set around the assignment in main;
+ # read sites of this const inside the class hierarchy raise
+ # NameError when the flag is set (slot is NULL during init).
+      if i < @const_init_class.length && @const_init_class[i] != ""
+        emit_raw("static int sp_init_in_progress_" + @const_names[i] + " = 0;")
+      end
       i = i + 1
     end
     if @const_names.length > 0
@@ -11138,11 +11148,25 @@ class Compiler
             @needs_rb_value = 1
           end
         end
+ # Issue #646: when the init RHS is `<Class>.new(...)`, set the
+ # per-const in-progress flag for the duration of the call so any
+ # read of this const inside the call chain raises NameError
+ # instead of derefing the NULL slot. SET before compile_expr
+ # (so any setup temps it emits also fall under the flag — the
+ # actual sp_<Class>_new() runs when the cst_X assignment fires);
+ # CLEAR after the assignment.
+        guarded_646 = (i < @const_init_class.length && @const_init_class[i] != "")
+        if guarded_646
+          emit("  sp_init_in_progress_" + @const_names[i] + " = 1;")
+        end
         if val == ""
           val = compile_expr(eid_init)
         end
         @current_lexical_scope = old_scope
         emit("  cst_" + @const_names[i] + " = " + val + ";")
+        if guarded_646
+          emit("  sp_init_in_progress_" + @const_names[i] + " = 0;")
+        end
         if type_is_pointer(@const_types[i]) == 1
           emit("  SP_GC_ROOT(cst_" + @const_names[i] + ");")
         end
@@ -11879,13 +11903,23 @@ class Compiler
         end
  # Issue #646: detect the self-referential init shape — a class
  # whose `initialize` reads a top-level const that's being
- # initialized via `<const> = <ThisClass>.new(...)`. The slot
- # is NULL during init; the read returns NULL and any subsequent
- # `.method` / `->iv_` dereference segfaults. Warn at compile
- # time so the user catches this before runtime. (MRI raises
- # NameError; closing the runtime gap would need lifecycle
- # tracking — see #646 discussion.)
+ # initialized via `<const> = <ThisClass>.new(...)`. Warn at
+ # compile time AND, when the const has a per-const in-progress
+ # flag (set by emit_main around the assignment), wrap the read
+ # with a runtime check that raises NameError if the flag is
+ # set. Matches MRI semantics rather than the silent partial-init
+ # segfault.
         warn_self_ref_const_init(rname)
+        if ci < @const_init_class.length && @const_init_class[ci] != ""
+          @needs_setjmp = 1
+ # sp_raise_cls never returns (longjmp), but C still requires
+ # a value-typed dead branch for the comma operator. Use a
+ # compound literal of the const's type so both struct and
+ # pointer slots type-check ((sp_App){0} for value-types,
+ # (sp_App *){0} effectively NULL for heap classes).
+          dead_default_csr = "(" + c_type(@const_types[ci]) + "){0}"
+          return "(sp_init_in_progress_" + rname + " ? (sp_raise_cls(\"NameError\", \"uninitialized constant " + rname + "\"), " + dead_default_csr + ") : cst_" + rname + ")"
+        end
         return "cst_" + rname
       end
  # a class constant in value position
@@ -37638,6 +37672,8 @@ class Compiler
       @const_types = val
     elsif name == "@const_scope_names"
       @const_scope_names = val
+    elsif name == "@const_init_class"
+      @const_init_class = val
     elsif name == "@cvar_names"
       @cvar_names = val
     elsif name == "@cvar_types"
