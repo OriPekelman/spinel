@@ -11534,7 +11534,7 @@ class Compiler
       if @current_class_idx >= 0
         ivar_t_iow = cls_ivar_type(@current_class_idx, @nd_name[nid])
       end
-      disp_iow = obj_op_dispatch_expr(ivar_t_iow, lhs_iow, op_iow, val_iow)
+      disp_iow = obj_op_dispatch_expr(ivar_t_iow, lhs_iow, op_iow, val_iow, infer_type(@nd_expression[nid]))
       if disp_iow != ""
         return "(" + lhs_iow + " = " + disp_iow + ")"
       end
@@ -24143,7 +24143,7 @@ class Compiler
  # returns the C expression `sp_<owner>_<op>(<recv_c>, <rhs_c>)`.
  # Returns "" when no dispatch applies (caller falls back to its
  # inline path, or to `warn_unresolved_call`).
-  def obj_op_dispatch_expr(recv_t, recv_c, op, rhs_c)
+  def obj_op_dispatch_expr(recv_t, recv_c, op, rhs_c, rhs_t = "")
     if is_obj_type(recv_t) == 0
       return ""
     end
@@ -24161,7 +24161,28 @@ class Compiler
     if owner != cname
       cast = "(sp_" + owner + " *)"
     end
-    "sp_" + owner + "_" + sanitize_name(op) + "(" + cast + recv_c + ", " + rhs_c + ")"
+ # When the user method's first param has been promoted to bigint
+ # by `--int-overflow=promote`, an int rhs needs the bigint wrap
+ # to match the C-level signature. Same shape for the reverse.
+    rhs_coerced = rhs_c
+    owner_ci = find_class_idx(owner)
+    if owner_ci >= 0 && rhs_t != "" && rhs_t != ""
+      midx_oo = cls_find_method_direct(owner_ci, op)
+      if midx_oo >= 0
+        pts_oo = cls_meth_ptypes_get(owner_ci, midx_oo)
+        if pts_oo.length > 0
+          first_pt_oo = base_type(pts_oo[0])
+          if first_pt_oo == "bigint" && rhs_t == "int"
+            @needs_bigint = 1
+            rhs_coerced = "sp_bigint_new_int(" + rhs_c + ")"
+          elsif first_pt_oo == "int" && rhs_t == "bigint"
+            @needs_bigint = 1
+            rhs_coerced = "sp_bigint_to_int((sp_Bigint *)" + rhs_c + ")"
+          end
+        end
+      end
+    end
+    "sp_" + owner + "_" + sanitize_name(op) + "(" + cast + recv_c + ", " + rhs_coerced + ")"
   end
 
   def if_branch_has_multi_stmt(body)
@@ -25219,7 +25240,7 @@ class Compiler
  # Same desugaring as the ivar form: `local OP= rhs` is
  # `local = local OP rhs`. Dispatch through the user-defined
  # operator when the local is obj-typed.
-      disp = obj_op_dispatch_expr(vt, vref, op, val)
+      disp = obj_op_dispatch_expr(vt, vref, op, val, infer_type(@nd_expression[nid]))
       if disp != ""
         emit("  " + vref + " = " + disp + ";")
         return
@@ -25609,7 +25630,7 @@ class Compiler
  # and the class defines OP, dispatch to the user method
  # instead of emitting a raw C `+=` (which on a pointer is
  # silently miscompiled as pointer arithmetic).
-      disp = obj_op_dispatch_expr(ivar_t, lhs, op, val)
+      disp = obj_op_dispatch_expr(ivar_t, lhs, op, val, infer_type(@nd_expression[nid]))
       if disp != ""
         emit("  " + lhs + " = " + disp + ";")
         return
