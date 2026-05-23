@@ -21126,7 +21126,7 @@ class Compiler
   def compile_open_class_dispatch_expr(nid, mname, rc, recv_type)
  # Open class method dispatch on built-in types
     oc_prefix = ""
-    if recv_type == "int"
+    if recv_type == "int" || recv_type == "bigint"
       oc_prefix = "__oc_Integer_"
     end
     if recv_type == "string"
@@ -21139,11 +21139,19 @@ class Compiler
       oc_name = oc_prefix + mname
       oc_mi = find_method_idx(oc_name)
       if oc_mi >= 0
+ # Open-class `self` for Integer is always `mrb_int` (see
+ # build_params_str at line 9207). In promote mode the call site's
+ # recv is sp_Bigint*; unbox so the function signature matches.
+        rc_oc = rc
+        if recv_type == "bigint"
+          @needs_bigint = 1
+          rc_oc = "sp_bigint_to_int((sp_Bigint *)" + rc + ")"
+        end
         ca = compile_call_args(nid)
         if ca != ""
-          return "sp_" + sanitize_name(oc_name) + "(" + rc + ", " + ca + ")"
+          return "sp_" + sanitize_name(oc_name) + "(" + rc_oc + ", " + ca + ")"
         else
-          return "sp_" + sanitize_name(oc_name) + "(" + rc + ")"
+          return "sp_" + sanitize_name(oc_name) + "(" + rc_oc + ")"
         end
       end
     end
