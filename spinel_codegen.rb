@@ -19100,11 +19100,17 @@ class Compiler
           bp = get_block_param(nid, 0)
           tmp = new_temp
           emit("  sp_IntArray *" + tmp + " = sp_IntArray_dup(" + rc + ");")
- # Use bubble sort with block as key function
+ # Use bubble sort with block as key function. In promote mode the
+ # block body may treat x as bigint (find_var_type returns bigint),
+ # so the inline emit's lv_<bp> must be sp_Bigint* to match.
+          bp_promote_sb = (@int_overflow_mode == "promote" && base_type(find_var_type(bp)) == "bigint") ? 1 : 0
+          bp_decl_sb = bp_promote_sb == 1 ? "sp_Bigint *" : "mrb_int"
+          bp_init_expr_sb = bp_promote_sb == 1 ? "sp_bigint_new_int(" : ""
+          bp_init_close_sb = bp_promote_sb == 1 ? ")" : ""
           emit("  { mrb_int _n = " + tmp + "->len;")
           emit("  for (mrb_int _i = 0; _i < _n - 1; _i++)")
           emit("    for (mrb_int _j = 0; _j < _n - 1 - _i; _j++) {")
-          emit("      mrb_int lv_" + bp + " = " + tmp + "->data[" + tmp + "->start + _j];")
+          emit("      " + bp_decl_sb + " lv_" + bp + " = " + bp_init_expr_sb + tmp + "->data[" + tmp + "->start + _j]" + bp_init_close_sb + ";")
           bbody = @nd_body[blk]
           bexpr = "0"
           bexpr_t_sb = "int"
@@ -19134,7 +19140,7 @@ class Compiler
             ka_init_sb = "sp_bigint_to_int((sp_Bigint *)" + bexpr + ")"
           end
           emit("      mrb_int _ka = " + ka_init_sb + ";")
-          emit("      lv_" + bp + " = " + tmp + "->data[" + tmp + "->start + _j + 1];")
+          emit("      lv_" + bp + " = " + bp_init_expr_sb + tmp + "->data[" + tmp + "->start + _j + 1]" + bp_init_close_sb + ";")
           kb_init_sb = bexpr
           if bexpr_t_sb == "bigint"
             kb_init_sb = "sp_bigint_to_int((sp_Bigint *)" + bexpr + ")"
