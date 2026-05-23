@@ -11919,6 +11919,47 @@ class Compiler
       if disp != ""
         return "(" + vref + " = " + disp + ")"
       end
+ # promote-mode bigint local: raw C `OP=` on a sp_Bigint *
+ # pointer would be illegal arithmetic. Route through the
+ # sp_bigint_<op> helpers. Mirrors the InstanceVariableOperator
+ # WriteNode arm below.
+      if base_type(vt) == "bigint"
+        @needs_bigint = 1
+        rhs_t_lov = infer_type(@nd_expression[nid])
+        if rhs_t_lov != "bigint" && expr_emit_is_bigint(@nd_expression[nid]) == 1
+          rhs_t_lov = "bigint"
+        end
+        rhs_big_lov = rhs_t_lov == "bigint" ? "(sp_Bigint *)(" + val + ")" : "sp_bigint_new_int(" + val + ")"
+        if op == "+"
+          return "(" + vref + " = sp_bigint_add((sp_Bigint *)" + vref + ", " + rhs_big_lov + "))"
+        end
+        if op == "-"
+          return "(" + vref + " = sp_bigint_sub((sp_Bigint *)" + vref + ", " + rhs_big_lov + "))"
+        end
+        if op == "*"
+          return "(" + vref + " = sp_bigint_mul((sp_Bigint *)" + vref + ", " + rhs_big_lov + "))"
+        end
+        if op == "/"
+          return "(" + vref + " = sp_bigint_div((sp_Bigint *)" + vref + ", " + rhs_big_lov + "))"
+        end
+        if op == "%"
+          return "(" + vref + " = sp_bigint_mod((sp_Bigint *)" + vref + ", " + rhs_big_lov + "))"
+        end
+        if op == "&"
+          return "(" + vref + " = sp_bigint_and((sp_Bigint *)" + vref + ", " + rhs_big_lov + "))"
+        end
+        if op == "|"
+          return "(" + vref + " = sp_bigint_or((sp_Bigint *)" + vref + ", " + rhs_big_lov + "))"
+        end
+        if op == "^"
+          return "(" + vref + " = sp_bigint_xor((sp_Bigint *)" + vref + ", " + rhs_big_lov + "))"
+        end
+        if op == "<<" || op == ">>"
+          shamt_lov = rhs_t_lov == "bigint" ? "sp_bigint_to_int(" + rhs_big_lov + ")" : "(" + val + ")"
+          h_lov = op == "<<" ? "sp_bigint_shl" : "sp_bigint_shr"
+          return "(" + vref + " = " + h_lov + "((sp_Bigint *)" + vref + ", " + shamt_lov + "))"
+        end
+      end
       return "(" + vref + " " + op + "= " + val + ")"
     end
     if t == "InstanceVariableOperatorWriteNode"
@@ -26213,32 +26254,18 @@ class Compiler
         emit("  " + vref + " = " + disp + ";")
         return
       end
-      if vt == "bigint"
+      if base_type(vt) == "bigint"
         at = infer_type(@nd_expression[nid])
- # The cache may say "int" even though the rhs emits bigint
- # (arith CallNode with bigint operand, or any of the rhs
- # shapes mirrored by compile_stmt's IVW arm). Peek the
- # operator's operands to upgrade the cached type.
-        if at != "bigint" && @nd_expression[nid] >= 0 && @nd_type[@nd_expression[nid]] == "CallNode"
-          rhs_mn_lv = @nd_name[@nd_expression[nid]]
-          if rhs_mn_lv == "+" || rhs_mn_lv == "-" || rhs_mn_lv == "*" || rhs_mn_lv == "/" || rhs_mn_lv == "%" || rhs_mn_lv == "**"
-            rhs_recv_lv = @nd_receiver[@nd_expression[nid]]
-            if rhs_recv_lv >= 0 && base_type(infer_type(rhs_recv_lv)) == "bigint"
-              at = "bigint"
-            else
-              rhs_args_lv = @nd_arguments[@nd_expression[nid]]
-              if rhs_args_lv >= 0
-                ra_lv = get_args(rhs_args_lv)
-                if ra_lv.length > 0 && base_type(infer_type(ra_lv[0])) == "bigint"
-                  at = "bigint"
-                end
-              end
-            end
-          end
+ # The cache may say "int" even though the rhs emits bigint;
+ # the unified emit walker covers arith, bitop, user methods,
+ # paren, and unary.
+        if at != "bigint" && expr_emit_is_bigint(@nd_expression[nid]) == 1
+          at = "bigint"
         end
  # Cast away volatile from bigint locals (see compile_bigint_arg).
         barg = at == "bigint" ? "(sp_Bigint *)" + val : "sp_bigint_new_int(" + val + ")"
         vref_b = "(sp_Bigint *)" + vref
+        @needs_bigint = 1
         if op == "+"
           emit("  " + vref + " = sp_bigint_add(" + vref_b + ", " + barg + ");")
         end
@@ -26250,6 +26277,23 @@ class Compiler
         end
         if op == "/"
           emit("  " + vref + " = sp_bigint_div(" + vref_b + ", " + barg + ");")
+        end
+        if op == "%"
+          emit("  " + vref + " = sp_bigint_mod(" + vref_b + ", " + barg + ");")
+        end
+        if op == "&"
+          emit("  " + vref + " = sp_bigint_and(" + vref_b + ", " + barg + ");")
+        end
+        if op == "|"
+          emit("  " + vref + " = sp_bigint_or(" + vref_b + ", " + barg + ");")
+        end
+        if op == "^"
+          emit("  " + vref + " = sp_bigint_xor(" + vref_b + ", " + barg + ");")
+        end
+        if op == "<<" || op == ">>"
+          shamt_slv = at == "bigint" ? "sp_bigint_to_int(" + barg + ")" : "(" + val + ")"
+          h_slv = op == "<<" ? "sp_bigint_shl" : "sp_bigint_shr"
+          emit("  " + vref + " = " + h_slv + "(" + vref_b + ", " + shamt_slv + ");")
         end
         emit("  if(sp_gc_bytes>sp_gc_threshold){size_t _b=sp_gc_bytes;sp_gc_collect();size_t _f=_b-sp_gc_bytes;if(_f<_b/4)sp_gc_threshold=_b*2;else if(sp_gc_bytes>0){sp_gc_threshold=sp_gc_bytes*4;if(sp_gc_threshold<sp_gc_threshold_init)sp_gc_threshold=sp_gc_threshold_init;}else sp_gc_threshold=sp_gc_threshold_init;}")
         return
