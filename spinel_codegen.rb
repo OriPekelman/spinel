@@ -11645,6 +11645,43 @@ class Compiler
     "((" + expr + "), TRUE)"
   end
 
+ # Issue #660 helper. If left_nid is `hash[k]` on a typed-hash recv
+ # with a non-poly value type, return "<Class>|<value_type>" so
+ # compile_or can rewrite to `has_key ? get : rhs`. Returns ""
+ # for shapes that should keep the legacy truthy lowering (poly
+ # hash variants already return sp_box_nil on miss; non-hash
+ # receivers have their own truthy semantics).
+  def lhs_typed_hash_get_for_or(left_nid)
+    if left_nid < 0 || @nd_type[left_nid] != "CallNode"
+      return ""
+    end
+    if @nd_name[left_nid] != "[]"
+      return ""
+    end
+    recv_nid_oh = @nd_receiver[left_nid]
+    args_id_oh = @nd_arguments[left_nid]
+    if recv_nid_oh < 0 || args_id_oh < 0
+      return ""
+    end
+    aargs_oh = get_args(args_id_oh)
+    if aargs_oh.length != 1
+      return ""
+    end
+    rt_oh = base_type(infer_type(recv_nid_oh))
+    if rt_oh == "str_int_hash"
+      return "StrIntHash|int|str"
+    elsif rt_oh == "str_str_hash"
+      return "StrStrHash|string|str"
+    elsif rt_oh == "sym_int_hash"
+      return "SymIntHash|int|sym"
+    elsif rt_oh == "sym_str_hash"
+      return "SymStrHash|string|sym"
+    elsif rt_oh == "int_str_hash"
+      return "IntStrHash|string|int"
+    end
+    ""
+  end
+
   def or_result_type(nid)
     lt = infer_type(@nd_left[nid])
     rt = infer_type(@nd_right[nid])
@@ -12370,6 +12407,50 @@ class Compiler
       lt = infer_type(left_nid)
       rt = infer_type(right_nid)
       ot = or_result_type(nid)
+ # Issue #660: `hash[k] || rhs` where the hash is a typed
+ # (non-poly) variant lowers the lhs to `sp_*Hash_get(h, k)` which
+ # returns the value type's zero (0 / "") on missing key. The truthy
+ # check on that zero is always TRUE (`((expr), TRUE)`), so the rhs
+ # arm is unreachable -- diverging from MRI's nil-default semantics.
+ #
+ # Special-case the shape: when the lhs is a CallNode `[]` on a
+ # typed-hash receiver, gate the ternary on `has_key`, not on the
+ # value's truthiness. The lhs is evaluated only when the key is
+ # present, so the call is single-eval safe. Poly-hash variants
+ # already return sp_box_nil on miss; skip them.
+      hash_or = lhs_typed_hash_get_for_or(left_nid)
+      if hash_or != ""
+        recv_nid_or = @nd_receiver[left_nid]
+        rc_or = compile_expr(recv_nid_or)
+        parts_or = hash_or.split("|")
+        cls_or = parts_or[0]
+        val_t_or = parts_or[1]
+        key_kind_or = parts_or[2]
+ # Reuse the per-recv-kind key coercer helpers so a sym->str
+ # widening (StrIntHash key from a SymbolNode arg) lands the
+ # same emit as the standalone `h[k]` call.
+        if key_kind_or == "str"
+          key_or = compile_str_arg0(left_nid)
+        elsif key_kind_or == "sym"
+          key_or = compile_arg0_as_sym(left_nid)
+        elsif key_kind_or == "int"
+          key_or = compile_arg0_as_int(left_nid)
+        else
+          args_id_or_fallback = @nd_arguments[left_nid]
+          aa_or_fallback = get_args(args_id_or_fallback)
+          key_or = compile_expr(aa_or_fallback[0])
+        end
+        right_expr = compile_expr(right_nid)
+        if ot == "poly"
+          @needs_rb_value = 1
+          lhs_box_or = box_value_to_poly(val_t_or, "sp_" + cls_or + "_get(" + rc_or + ", " + key_or + ")")
+          right_box_or = base_type(rt) == "poly" ? right_expr : box_value_to_poly(rt, right_expr)
+        else
+          lhs_box_or = "sp_" + cls_or + "_get(" + rc_or + ", " + key_or + ")"
+          right_box_or = right_expr
+        end
+        return "(sp_" + cls_or + "_has_key(" + rc_or + ", " + key_or + ") ? " + lhs_box_or + " : " + right_box_or + ")"
+      end
       if ot != "bool" || lt != "bool" || rt != "bool"
         if ot == "poly"
           @needs_rb_value = 1
