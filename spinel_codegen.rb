@@ -15484,6 +15484,57 @@ class Compiler
     "({ sp_Time _a = " + la + "; sp_Time _b = " + lb + "; (_a.tv_sec < _b.tv_sec) ? -1 : (_a.tv_sec > _b.tv_sec) ? 1 : (_a.tv_nsec < _b.tv_nsec) ? -1 : (_a.tv_nsec > _b.tv_nsec) ? 1 : 0; })"
   end
 
+ # True (1) iff the C expression `compile_expr(nid)` would emit
+ # an `sp_Bigint *` value, even when `infer_type(nid)` returns
+ # the stale-int cache from annotate_all_node_types. Walks
+ # through ParenthesesNode and recurses into arith/bitop CallNodes
+ # whose operands carry bigint type. The chain shape
+ # `((a | b) & c) | d` needs the recursive walk -- only the
+ # deepest operand directly types as bigint; each enclosing op
+ # promotes through sp_bigint_<op> and the outer ops would
+ # otherwise see "int" via infer_type. Promote-mode --
+ # specifically optcarrot's CPU and PPU which thread multi-level
+ # bitop chains through `self->iv_x` (bigint ivar) operands.
+  def expr_emit_is_bigint(nid)
+    if nid < 0
+      return 0
+    end
+    if base_type(infer_type(nid)) == "bigint"
+      return 1
+    end
+    t = @nd_type[nid]
+    if t == "ParenthesesNode"
+      body_eb = @nd_body[nid]
+      if body_eb >= 0
+        stmts_eb = get_stmts(body_eb)
+        if stmts_eb.length == 1
+          return expr_emit_is_bigint(stmts_eb[0])
+        end
+      end
+      return 0
+    end
+    if t != "CallNode"
+      return 0
+    end
+    mn_eb = @nd_name[nid]
+    if mn_eb != "+" && mn_eb != "-" && mn_eb != "*" && mn_eb != "/" && mn_eb != "%" && mn_eb != "**" &&
+       mn_eb != "&" && mn_eb != "|" && mn_eb != "^" && mn_eb != "<<" && mn_eb != ">>"
+      return 0
+    end
+    rcv_eb = @nd_receiver[nid]
+    if rcv_eb >= 0 && expr_emit_is_bigint(rcv_eb) == 1
+      return 1
+    end
+    args_eb = @nd_arguments[nid]
+    if args_eb >= 0
+      ra_eb = get_args(args_eb)
+      if ra_eb.length > 0 && expr_emit_is_bigint(ra_eb[0]) == 1
+        return 1
+      end
+    end
+    0
+  end
+
   def compile_operator_expr(nid, mname, recv)
  # Bigint operators
     lt = infer_type(recv)
@@ -15497,6 +15548,20 @@ class Compiler
         end
       end
     end
+ # Stale-int recv whose actual emit is bigint: an arith / bit-op
+ # CallNode whose own operands include a bigint locks the chain
+ # into bigint (compile_operator_expr returns sp_Bigint *). The
+ # parent operator sees the stale "int" cache from
+ # annotate_all_node_types but the C expression is sp_Bigint *.
+ # Detect that here so we enter the bigint-dispatch block and
+ # route through sp_bigint_<op>. The chain can be multiple
+ # levels deep (`((a | b) & 4095) | 8192` — three CallNodes,
+ # only the deepest has a direct bigint operand) so this is a
+ # recursive walk through ParenthesesNode + arith/bitop
+ # CallNode nodes.
+    if lt != "bigint" && expr_emit_is_bigint(recv) == 1
+      lt = "bigint"
+    end
     if lt == "bigint"
       rc_raw = compile_expr(recv)
  # Cast away volatile from bigint locals (see compile_bigint_arg).
@@ -15506,22 +15571,15 @@ class Compiler
  # expression with another sp_bigint_new_int (canonical
  # left-associative `a + b + c` chain shape, three bigint locals).
       recv_t_op = infer_type(recv)
-      if recv_t_op != "bigint" && @nd_type[recv] == "CallNode"
-        rmn_op = @nd_name[recv]
-        if rmn_op == "+" || rmn_op == "-" || rmn_op == "*" || rmn_op == "/" || rmn_op == "%" || rmn_op == "**"
-          rrcv_op = @nd_receiver[recv]
-          if rrcv_op >= 0 && base_type(infer_type(rrcv_op)) == "bigint"
-            recv_t_op = "bigint"
-          else
-            rargs_op = @nd_arguments[recv]
-            if rargs_op >= 0
-              ra_op = get_args(rargs_op)
-              if ra_op.length > 0 && base_type(infer_type(ra_op[0])) == "bigint"
-                recv_t_op = "bigint"
-              end
-            end
-          end
-        end
+ # `infer_type(recv)` may say "int" for an arith/bitop CallNode
+ # whose actual emit is sp_Bigint *. Use the recursive walker to
+ # decide whether rc_raw is already a bigint expression. Without
+ # this we'd wrap an already-bigint sub-expression with another
+ # sp_bigint_new_int (canonical left-associative chain shape:
+ # `(a + b + c)` with three bigint locals, or
+ # `((a | b) & c) | d` from optcarrot's flag-pack code).
+      if recv_t_op != "bigint" && expr_emit_is_bigint(recv) == 1
+        recv_t_op = "bigint"
       end
       rc = recv_t_op == "bigint" ? "(sp_Bigint *)" + rc_raw : "sp_bigint_new_int(" + rc_raw + ")"
       arg = compile_bigint_arg(nid)
@@ -15561,13 +15619,30 @@ class Compiler
       if mname == "!="
         return "(sp_bigint_cmp(" + rc + ", " + arg + ") != 0)"
       end
- # Bitwise / shift on a bigint recv: unbox to mrb_int, apply
- # native op, rebox. Only when the receiver is genuinely bigint
- # (not poly widened to share this `lt == bigint` block via the
- # arg-side bigint check above) — poly recv shifts dispatch
- # through a different runtime path.
-      if (mname == "&" || mname == "|" || mname == "^" || mname == "<<" || mname == ">>") && infer_type(recv) == "bigint"
-        return "sp_bigint_new_int(sp_bigint_to_int(" + rc + ") " + mname + " sp_bigint_to_int(" + arg + "))"
+ # Bitwise / shift on a bigint operand: route through the
+ # sp_bigint_<op> helpers. Both operands are already boxed to
+ # bigint (rc + arg via compile_bigint_arg), so the helper can
+ # consume them directly. Helpers themselves round-trip through
+ # int64 internally -- acceptable for the promote-mode common
+ # case (small ints widened to bigint). The legacy in-line
+ # `sp_bigint_new_int(unbox << unbox)` shape only fired when
+ # `infer_type(recv) == "bigint"` exactly, which missed any
+ # stale-int recv whose actual emit was bigint (the canonical
+ # `(data << 1) & 255` shape in optcarrot's CPU emulator).
+      if mname == "&"
+        return "sp_bigint_and(" + rc + ", " + arg + ")"
+      end
+      if mname == "|"
+        return "sp_bigint_or(" + rc + ", " + arg + ")"
+      end
+      if mname == "^"
+        return "sp_bigint_xor(" + rc + ", " + arg + ")"
+      end
+      if mname == "<<"
+        return "sp_bigint_shl(" + rc + ", sp_bigint_to_int(" + arg + "))"
+      end
+      if mname == ">>"
+        return "sp_bigint_shr(" + rc + ", sp_bigint_to_int(" + arg + "))"
       end
     end
  # Operators

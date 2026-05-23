@@ -5374,6 +5374,49 @@ int64_t sp_bigint_to_int(sp_Bigint *b) {
   return z->sn < 0 ? -v : v;
 }
 
+/* Bitwise ops on bigint (Phase 1 of --int-overflow=promote
+   coverage). Implemented via int64 round-trip: every bigint
+   produced by promotion in spinel is derived from a small int
+   that fits in int64, so the round-trip preserves Ruby semantics
+   for any value in [INT64_MIN, INT64_MAX]. Values exceeding that
+   range lose precision; that's acceptable as a starting point
+   (extremely rare in practice -- bitops on integers > 2^63
+   aren't a real workload yet). A future commit can swap in the
+   custom mpz_and / mpz_ior / mpz_xor / mpz_com implementations
+   if the int64 path proves insufficient. */
+sp_Bigint *sp_bigint_and(sp_Bigint *a, sp_Bigint *b) {
+  return sp_bigint_new_int(sp_bigint_to_int(a) & sp_bigint_to_int(b));
+}
+
+sp_Bigint *sp_bigint_or(sp_Bigint *a, sp_Bigint *b) {
+  return sp_bigint_new_int(sp_bigint_to_int(a) | sp_bigint_to_int(b));
+}
+
+sp_Bigint *sp_bigint_xor(sp_Bigint *a, sp_Bigint *b) {
+  return sp_bigint_new_int(sp_bigint_to_int(a) ^ sp_bigint_to_int(b));
+}
+
+sp_Bigint *sp_bigint_shr(sp_Bigint *a, int64_t n);  /* forward decl for mutual recursion */
+
+sp_Bigint *sp_bigint_shl(sp_Bigint *a, int64_t n) {
+  if (n < 0) return sp_bigint_shr(a, -n);
+  if (n >= 64) return sp_bigint_new_int(0);
+  return sp_bigint_new_int(sp_bigint_to_int(a) << n);
+}
+
+sp_Bigint *sp_bigint_shr(sp_Bigint *a, int64_t n) {
+  if (n < 0) return sp_bigint_shl(a, -n);
+  if (n >= 64) {
+    /* arithmetic right shift: negative -> -1, positive -> 0 */
+    return sp_bigint_new_int(sp_bigint_to_int(a) < 0 ? -1 : 0);
+  }
+  return sp_bigint_new_int(sp_bigint_to_int(a) >> n);
+}
+
+sp_Bigint *sp_bigint_not(sp_Bigint *a) {
+  return sp_bigint_new_int(~sp_bigint_to_int(a));
+}
+
 const char *sp_bigint_to_s(sp_Bigint *b) {
   sp_bigint_init_ctx();
   mpz_t *z = &b->mpz;

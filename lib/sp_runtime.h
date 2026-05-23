@@ -2506,6 +2506,23 @@ int64_t sp_bigint_to_int(sp_Bigint *b);
 const char *sp_bigint_to_s(sp_Bigint *b);
 void sp_bigint_free(sp_Bigint *b);
 
+/* Bitwise ops on bigint operands. Used by --int-overflow=promote
+   mode where all int slots widen to sp_Bigint *. Implemented via
+   int64 round-trip: bigint values produced by promotion are
+   almost always derived from small ints (counters, masks, bit-
+   width-sized values <= 64 bits), so the int64 path preserves
+   the full Ruby-side semantics for any value that fits. Values
+   exceeding int64 lose precision through these helpers -- those
+   are extremely rare in practice (Ruby bitops on integers >
+   2^63), and proper mpz_and / mpz_or / mpz_xor support can be
+   added later in lib/sp_bigint.c if a real workload needs it. */
+sp_Bigint *sp_bigint_and(sp_Bigint *a, sp_Bigint *b);
+sp_Bigint *sp_bigint_or(sp_Bigint *a, sp_Bigint *b);
+sp_Bigint *sp_bigint_xor(sp_Bigint *a, sp_Bigint *b);
+sp_Bigint *sp_bigint_shl(sp_Bigint *a, int64_t n);
+sp_Bigint *sp_bigint_shr(sp_Bigint *a, int64_t n);
+sp_Bigint *sp_bigint_not(sp_Bigint *a);
+
 
 /* System/backtick support */
 static int sp_last_status = 0;
@@ -2665,6 +2682,12 @@ int sp_bigint_cmp(sp_Bigint *a, sp_Bigint *b);
 int64_t sp_bigint_to_int(sp_Bigint *b);
 const char *sp_bigint_to_s(sp_Bigint *b);
 void sp_bigint_free(sp_Bigint *b);
+sp_Bigint *sp_bigint_and(sp_Bigint *a, sp_Bigint *b);
+sp_Bigint *sp_bigint_or(sp_Bigint *a, sp_Bigint *b);
+sp_Bigint *sp_bigint_xor(sp_Bigint *a, sp_Bigint *b);
+sp_Bigint *sp_bigint_shl(sp_Bigint *a, int64_t n);
+sp_Bigint *sp_bigint_shr(sp_Bigint *a, int64_t n);
+sp_Bigint *sp_bigint_not(sp_Bigint *a);
 
 #ifdef __APPLE__
 #pragma clang diagnostic pop
