@@ -408,6 +408,12 @@ class Compiler
     @hoisted_strlen_recv = ""
     @in_yield_method = 0
     @current_method_yield_arity = 1
+ # Per-method `_block` C-signature projection (joined by "|").
+ # Populated when entering a yield-using method emit so
+ # compile_yield_stmt can coerce literal IntegerNode args to the
+ # widened sp_Bigint * slot under promote-mode methods. "" means
+ # no projection / mrb_int default.
+    @current_method_blk_param_types = ""
     @in_gc_scope = 0
  # Set during the arity-0 instance_eval trampoline inlining so
  # receiverless calls in the spliced block body dispatch against
@@ -10435,8 +10441,12 @@ class Compiler
       if cls_method_has_yield(ci, midx) == 1
         @in_yield_method = 1
         @current_method_yield_arity = cls_method_yield_arity(ci, midx)
+        cm_bodies_cur = @cls_meth_bodies[ci].split(";")
+        bid_cur = midx < cm_bodies_cur.length ? cm_bodies_cur[midx].to_i : -1
+        @current_method_blk_param_types = blk_param_types_for_body(bid_cur)
       else
         @in_yield_method = 0
+        @current_method_blk_param_types = ""
       end
     end
 
@@ -10763,8 +10773,10 @@ class Compiler
     if @meth_has_yield[mi] == 1
       @in_yield_method = 1
       @current_method_yield_arity = method_yield_arity(mi)
+      @current_method_blk_param_types = blk_param_types_for_body(@meth_body_ids[mi])
     else
       @in_yield_method = 0
+      @current_method_blk_param_types = ""
     end
 
     pnames = @meth_param_names[mi].split(",")
@@ -37370,18 +37382,52 @@ class Compiler
   def compile_yield_stmt(nid)
     args_id = @nd_arguments[nid]
     emitted = "".split(",")
+ # Per-position projected block param types from analyze. When the
+ # slot is "bigint", coerce int args to sp_bigint_new_int so the
+ # call matches the widened `_block(sp_Bigint *, ...)` sig emitted
+ # by yield_params_suffix. Symmetric int<-bigint coerce covers
+ # methods whose projection didn't widen but a body site emitted
+ # a bigint expression.
+    bpt_arr = "".split(",")
+    if @current_method_blk_param_types != ""
+      bpt_arr = @current_method_blk_param_types.split("|")
+    end
     if args_id >= 0
       aids = get_args(args_id)
       k = 0
       while k < aids.length
-        emitted.push(compile_expr(aids[k]))
+        val_y = compile_expr(aids[k])
+        arg_t_y = infer_type(aids[k])
+        slot_t_y = k < bpt_arr.length ? bpt_arr[k] : ""
+ # `expr_emit_is_bigint` catches the case where the cache says
+ # "int" but the actual C emit picked sp_bigint_*; without it the
+ # `arg_t_y == "int"` branch double-wraps with sp_bigint_new_int.
+        emit_is_bigint = expr_emit_is_bigint(aids[k]) == 1
+        if slot_t_y == "bigint" && arg_t_y != "bigint" && !emit_is_bigint
+          @needs_bigint = 1
+          if arg_t_y == "int" || arg_t_y == "" || arg_t_y == "nil"
+            val_y = "sp_bigint_new_int(" + val_y + ")"
+          end
+        elsif slot_t_y != "" && slot_t_y != "bigint" && (arg_t_y == "bigint" || emit_is_bigint)
+          @needs_bigint = 1
+          val_y = "sp_bigint_to_int((sp_Bigint *)" + val_y + ")"
+        end
+        emitted.push(val_y)
         k = k + 1
       end
     end
  # Pad to the enclosing method's max yield arity so the call matches
  # the function-pointer signature emitted by yield_params_suffix.
+ # Bigint slots need `sp_bigint_new_int(0)` not raw `0` so the
+ # pad value's C type matches the widened sig.
     while emitted.length < @current_method_yield_arity
-      emitted.push("0")
+      pad_slot_t = emitted.length < bpt_arr.length ? bpt_arr[emitted.length] : ""
+      if pad_slot_t == "bigint"
+        @needs_bigint = 1
+        emitted.push("sp_bigint_new_int(0)")
+      else
+        emitted.push("0")
+      end
     end
  # When the enclosing method declares `&block`, fall back to invoking the
  # captured proc if the yield-ABI slot is empty. This matches Ruby semantics
@@ -37657,10 +37703,14 @@ class Compiler
             bp_t_yarg = find_var_type(bp_names[k])
             arg_v_yarg = compile_expr_remap(aids[k], map_from, map_to)
             arg_t_yarg = infer_type(aids[k])
-            if bp_t_yarg == "bigint" && arg_t_yarg == "int"
+ # Stale `arg_t_yarg == "int"` when the actual emit is sp_bigint_*
+ # (arith on a bigint LV via compile_expr_remap). expr_emit_is_bigint
+ # walks the AST shape so we don't double-wrap.
+            arg_emit_bigint_y = expr_emit_is_bigint(aids[k]) == 1
+            if bp_t_yarg == "bigint" && arg_t_yarg == "int" && !arg_emit_bigint_y
               @needs_bigint = 1
               arg_v_yarg = "sp_bigint_new_int(" + arg_v_yarg + ")"
-            elsif bp_t_yarg == "int" && arg_t_yarg == "bigint"
+            elsif bp_t_yarg == "int" && (arg_t_yarg == "bigint" || arg_emit_bigint_y)
               @needs_bigint = 1
               arg_v_yarg = "sp_bigint_to_int((sp_Bigint *)" + arg_v_yarg + ")"
             end
@@ -38522,10 +38572,14 @@ class Compiler
  # so the destination slot's bigint pointer type matches.
             dst_t = find_var_type(dst)
             arg_t = infer_type(yaids[yk])
-            if base_type(dst_t) == "bigint" && arg_t == "int"
+ # Stale `arg_t == "int"` cache when the emitted expr is already
+ # sp_Bigint * (arith on a bigint LV). expr_emit_is_bigint walks
+ # the shape so we don't double-wrap with sp_bigint_new_int.
+            arg_emit_bigint = expr_emit_is_bigint(yaids[yk]) == 1
+            if base_type(dst_t) == "bigint" && arg_t == "int" && !arg_emit_bigint
               @needs_bigint = 1
               v_y = "sp_bigint_new_int(" + v_y + ")"
-            elsif base_type(dst_t) == "int" && arg_t == "bigint"
+            elsif base_type(dst_t) == "int" && (arg_t == "bigint" || arg_emit_bigint)
               @needs_bigint = 1
               v_y = "sp_bigint_to_int((sp_Bigint *)" + v_y + ")"
             end

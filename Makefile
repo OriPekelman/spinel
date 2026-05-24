@@ -380,13 +380,6 @@ TESTS := $(wildcard test/*.rb)
 # auto-promotes to bigint and the expected output diverges by design.
 ifeq ($(SPINEL_INT_OVERFLOW),promote)
 TESTS := $(filter-out test/int_overflow_raises.rb,$(TESTS))
-# nested_yield_with_block_param: in promote mode the yield-using
-# function bodies (sp_inner, sp_double_then_emit) emit
-# `_block(sp_bigint_mul(..., ...))` against a `_block(mrb_int, ...)`
-# signature -- pre-existing yield/bigint codegen mismatch unrelated
-# to the inliner that the test covers. Filtered until that codegen
-# path is bigint-aware.
-TESTS := $(filter-out test/nested_yield_with_block_param.rb,$(TESTS))
 endif
 TEST_TARGETS := $(patsubst test/%.rb,build/test-results/%.ok,$(TESTS))
 
