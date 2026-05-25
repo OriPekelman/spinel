@@ -8091,6 +8091,29 @@ class Compiler
       if @nd_type[sid] == "DefNode"
         collect_class_method(ci, sid)
       end
+ # `class << self; def X; ...; end; end` inside a class body --
+ # the def is a singleton method on the enclosing class,
+ # equivalent to `def self.X`. Register as a class method on
+ # this class. Issue #719.
+      if @nd_type[sid] == "SingletonClassNode"
+        sbody_id = @nd_body[sid]
+        if sbody_id >= 0
+          sbody_stmts = get_stmts(sbody_id)
+          sbi = 0
+          while sbi < sbody_stmts.length
+            sb = sbody_stmts[sbi]
+            if @nd_type[sb] == "DefNode" && @nd_receiver[sb] < 0
+              sb_name = @nd_name[sb]
+              sb_params = collect_params_str(sb)
+              sb_ptypes = collect_ptypes_str(sb, ci)
+              sb_defs = collect_defaults_str(sb)
+              sb_body_id = @nd_body[sb]
+              append_cls_cmeth(ci, sb_name, sb_params, sb_ptypes, "int", sb_body_id, sb_defs)
+            end
+            sbi = sbi + 1
+          end
+        end
+      end
       if @nd_type[sid] == "ConstantWriteNode"
         collect_scoped_constant(cname, sid)
       end
