@@ -39695,6 +39695,13 @@ class Compiler
       end
       return
     end
+    if @nd_type[last] == "ForNode"
+      compile_for_stmt(last)
+      if return_type != "void"
+        emit("  return " + c_return_default(return_type) + ";")
+      end
+      return
+    end
     if @nd_type[last] == "YieldNode"
       compile_yield_stmt(last)
       if return_type != "void"
