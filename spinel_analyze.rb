@@ -1993,6 +1993,12 @@ class Compiler
     if t == "FloatNode"
       return "float"
     end
+ # Issue #868: regex literal as a value (`/x/.source` etc.).
+ # Without this the bare literal infers as int (unresolved default)
+ # and accessor methods fall through to the int dispatch.
+    if t == "RegularExpressionNode"
+      return "regexp"
+    end
     if t == "StringNode"
       return "string"
     end
@@ -3925,6 +3931,14 @@ class Compiler
         return ""
       end
       return "string"
+    end
+ # Issue #868: Regexp#source returns the pattern string;
+ # Regexp#options returns the engine flag bitmask as int.
+    if mname == "source" && recv >= 0 && @nd_type[recv] == "RegularExpressionNode"
+      return "string"
+    end
+    if mname == "options" && recv >= 0 && @nd_type[recv] == "RegularExpressionNode"
+      return "int"
     end
     if mname == "inspect"
       return "string"

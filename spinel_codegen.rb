@@ -15612,6 +15612,33 @@ class Compiler
       end
     end
 
+ # Issue #868: Regexp accessors -- only the literal recv form is
+ # supported at this stage (dynamic-pattern recvs would need a
+ # runtime Regexp struct that carries source/options). For now,
+ # literal /pat/.source returns the raw pattern string, .options
+ # returns the engine flags packed per CRuby.
+    if recv >= 0 && @nd_type[recv] == "RegularExpressionNode"
+      if mname == "source"
+        return c_string_literal(@nd_unescaped[recv])
+      end
+      if mname == "options"
+ # Translate prism's nd_flags bits (4=IGNORECASE, 8=EXTENDED,
+ # 16=MULTILINE) to CRuby's Regexp::* bit mask
+ # (1=IGNORECASE, 2=EXTENDED, 4=MULTILINE).
+        pf = @nd_flags[recv]
+        opts = 0
+        if (pf & 4) != 0
+          opts = opts | 1
+        end
+        if (pf & 8) != 0
+          opts = opts | 2
+        end
+        if (pf & 16) != 0
+          opts = opts | 4
+        end
+        return opts.to_s + "LL"
+      end
+    end
  # regex.match? / regex.match / regex =~ str — receiver is the regex
  # (typically a constant referring to a /…/ literal). Dispatched here
  # rather than compile_string_method_expr, which wants a string
