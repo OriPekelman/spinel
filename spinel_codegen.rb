@@ -38195,6 +38195,37 @@ class Compiler
         pop_scope
         return tmp_arr
       end
+ # Issue #830: str_array.map { |s| <float expr> } -- the
+ # canonical shape is `str.split.map(&:to_f)` which lowers
+ # to `{ |s| s.to_f }`. Without this branch the accumulator
+ # is sp_StrArray and the push attempts to store a double
+ # into a const char * slot.
+      if block_ret == "float"
+        emit("  sp_FloatArray *" + tmp_arr + " = sp_FloatArray_new();")
+        emit("  SP_GC_ROOT(" + tmp_arr + ");")
+        emit("  for (mrb_int " + tmp_i + " = 0; " + tmp_i + " < sp_StrArray_length(" + rc + "); " + tmp_i + "++) {")
+        emit("    const char *lv_" + bp1 + " = sp_StrArray_get(" + rc + ", " + tmp_i + ");")
+        @indent = @indent + 1
+        if blk >= 0
+          body3 = @nd_body[blk]
+          stmts3 = body3 >= 0 ? get_stmts(body3) : []
+          if stmts3.length > 0
+            k = 0
+            while k < stmts3.length - 1
+              compile_stmt(stmts3[k])
+              k = k + 1
+            end
+            val = compile_expr(stmts3.last)
+            emit("  sp_FloatArray_push(" + tmp_arr + ", " + val + ");")
+          else
+            emit_map_default_push(tmp_arr, "float_array")
+          end
+        end
+        @indent = @indent - 1
+        emit("  }")
+        pop_scope
+        return tmp_arr
+      end
       @needs_str_array = 1
       emit("  sp_StrArray *" + tmp_arr + " = sp_StrArray_new();")
       emit("  SP_GC_ROOT(" + tmp_arr + ");")
