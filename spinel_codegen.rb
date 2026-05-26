@@ -25808,6 +25808,12 @@ class Compiler
     if type_is_pointer(at) == 1
       return "sp_box_obj((void *)(" + val + "), 0)"
     end
+ # FFI :ptr is a raw C pointer that type_is_pointer() reports as
+ # non-pointer (user-managed, not GC-traced). Boxing it into a poly
+ # slot still needs to survive as a pointer, not as an int.
+    if at == "ptr"
+      return "sp_box_obj((void *)(" + val + "), 0)"
+    end
     "sp_box_int(" + val + ")"
   end
 
