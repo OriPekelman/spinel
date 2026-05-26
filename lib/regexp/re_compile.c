@@ -292,6 +292,13 @@ compile_charclass(re_compiler *c)
     if (peek(c) == '-' && c->p + 1 < c->src_end && c->p[1] != ']') {
       next_char(c);  /* skip '-' */
       uint32_t hi = read_class_atom(c);
+      /* Issue #778: reversed range like [z-a] is a hard error in
+         CRuby (RegexpError "empty range in char class"). Spinel
+         used to silently accept it and emit a class that matched
+         nothing. Raise instead. */
+      if (cp > hi) {
+        compile_error(c, "empty range in char class");
+      }
       if (cp < 128 && hi < 128) {
         class_set_range(cc, (uint8_t)cp, (uint8_t)hi);
       }
@@ -300,7 +307,7 @@ compile_charclass(re_compiler *c)
            Mixed ASCII/non-ASCII ranges are rare; stash the whole
            span in the codepoint list (the bitmap covers ASCII only,
            so a non-ASCII upper bound forces the codepoint path). */
-        if (cp <= hi) class_add_range(cc, cp, hi);
+        class_add_range(cc, cp, hi);
       }
     }
     else {
