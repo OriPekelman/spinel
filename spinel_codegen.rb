@@ -21555,6 +21555,32 @@ class Compiler
       if mname == "difference"
         return "sp_StrArray_difference(" + rc + ", " + compile_arg0(nid) + ")"
       end
+      if mname == "min_by" || mname == "max_by"
+        if @nd_block[nid] >= 0
+          blk = @nd_block[nid]
+          bp = get_block_param(nid, 0)
+          tmp_sa_mb = new_temp
+          itmp_sa = new_temp
+          emit("  const char *" + tmp_sa_mb + " = sp_StrArray_get(" + rc + ", 0);")
+          init_sa = (mname == "min_by") ? "INT64_MAX" : "INT64_MIN"
+          cmp_sa = (mname == "min_by") ? "<" : ">"
+          emit("  { mrb_int _best_sa = " + init_sa + ";")
+          emit("  for (mrb_int " + itmp_sa + " = 0; " + itmp_sa + " < sp_StrArray_length(" + rc + "); " + itmp_sa + "++) {")
+          emit("    const char *lv_" + bp + " = sp_StrArray_get(" + rc + ", " + itmp_sa + ");")
+          bbody_sa = @nd_body[blk]
+          bexpr_sa = "0"
+          if bbody_sa >= 0
+            bs_sa = get_stmts(bbody_sa)
+            if bs_sa.length > 0
+              bexpr_sa = compile_expr(bs_sa.last)
+            end
+          end
+          emit("    mrb_int _v = " + bexpr_sa + ";")
+          emit("    if (_v " + cmp_sa + " _best_sa) { _best_sa = _v; " + tmp_sa_mb + " = lv_" + bp + "; }")
+          emit("  } }")
+          return tmp_sa_mb
+        end
+      end
     end
 
  # PolyArray methods

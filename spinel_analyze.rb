@@ -5217,10 +5217,25 @@ class Compiler
       end
       return "int_array"
     end
-    if mname == "min_by"
-      return "int"
-    end
-    if mname == "max_by"
+    if mname == "min_by" || mname == "max_by"
+ # Result is an *element* of the receiver array (Ruby:
+ # `[1,2,3].max_by{|x| -x} == 1`). Strip the `_array` suffix to
+ # recover the element type when receiver is typed.
+      if recv >= 0
+        rt_mb = infer_type(recv)
+        if rt_mb == "int_array"
+          return "int"
+        end
+        if rt_mb == "str_array"
+          return "string"
+        end
+        if rt_mb == "float_array"
+          return "float"
+        end
+        if rt_mb == "sym_array"
+          return "symbol"
+        end
+      end
       return "int"
     end
     if mname == "unshift"
