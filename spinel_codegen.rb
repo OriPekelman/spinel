@@ -15994,6 +15994,22 @@ class Compiler
         helper_ms = (mname == "prepend") ? "sp_String_prepend" : "sp_String_append"
         return "(" + helper_ms + "(" + rc + ", " + arg0_ms + "), " + rc + ")"
       end
+ # Issue #859: chomp! on mutable_str mutates in place and
+ # returns the receiver (CRuby returns nil if no change; spinel
+ # always returns self -- close-enough subset behaviour). Same
+ # shape for chop! / strip! / lstrip! / rstrip!.
+      if mname == "chomp!" || mname == "chop!" || mname == "strip!" || mname == "lstrip!" || mname == "rstrip!" || mname == "upcase!" || mname == "downcase!"
+        helper_bang = {
+          "chomp!" => "sp_str_chomp",
+          "chop!" => "sp_str_chop",
+          "strip!" => "sp_str_strip",
+          "lstrip!" => "sp_str_lstrip",
+          "rstrip!" => "sp_str_rstrip",
+          "upcase!" => "sp_str_upcase",
+          "downcase!" => "sp_str_downcase",
+        }[mname]
+        return "(sp_String_replace(" + rc + ", " + helper_bang + "(" + rc + "->data)), " + rc + ")"
+      end
       if mname == "insert"
         args_id_ms = @nd_arguments[nid]
         if args_id_ms >= 0
@@ -19041,16 +19057,10 @@ class Compiler
   end
 
   def compile_string_method_expr(nid, mname, rc)
- # String#chomp! alias for chomp. Returns the chomped string;
- # the Ruby `nil if no change` mutator semantic isn't preserved
- # (a documented quirk -- spinel strings are immutable so there's
- # nothing to mutate in place). Recurse so the local `mname` isn't
- # reassigned (writing back to a parameter triggers a body-usage
- # widening pass that lands warn_unresolved_call's mname as poly
- # in the bootstrap build). Issue #619 puzzle 10.
-    if mname == "chomp!"
-      return compile_string_method_expr(nid, "chomp", rc)
-    end
+ # chomp! / chop! / etc. on a frozen string literal raise
+ # FrozenError below; the mutable_str arm in compile_call_expr
+ # handles the legal case before reaching here. Issues #859,
+ # #886.
  # Comparable#clamp on string. Issue #899.
     if mname == "clamp"
       args_id_clp = @nd_arguments[nid]
@@ -19074,7 +19084,7 @@ class Compiler
  # downstream type inference doesn't break -- the raise is a
  # non-returning C call inside a stmt-expression.
     if mname == "insert" || mname == "prepend" || mname == "<<" || mname == "concat" || mname == "replace" || mname == "clear" ||
-       mname == "chop!" || mname == "upcase!" || mname == "downcase!" || mname == "swapcase!" || mname == "capitalize!" ||
+       mname == "chomp!" || mname == "chop!" || mname == "upcase!" || mname == "downcase!" || mname == "swapcase!" || mname == "capitalize!" ||
        mname == "sub!" || mname == "gsub!" || mname == "squeeze!" || mname == "strip!" || mname == "lstrip!" || mname == "rstrip!" ||
        mname == "tr!" || mname == "tr_s!" || mname == "delete!" || mname == "reverse!" || mname == "succ!" || mname == "next!"
       @needs_exc_class_hierarchy = 1
