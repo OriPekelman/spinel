@@ -22298,6 +22298,18 @@ class Compiler
       if (mname == "reduce" || mname == "inject") && reduce_sym_op_for(nid) != ""
         return "({ sp_IntArray *_arr = " + rc + "; mrb_int _acc = _arr->len > 0 ? sp_IntArray_get(_arr, 0) : 0; for (mrb_int _i = 1; _i < _arr->len; _i++) _acc = _acc " + reduce_sym_op_for(nid) + " sp_IntArray_get(_arr, _i); _acc; })"
       end
+ # `reduce(init, :op)` — explicit initial value plus a symbol
+ # operator. Differs from the 1-arg sym form by seeding with `init`
+ # and starting the iteration at index 0.
+      if (mname == "reduce" || mname == "inject") && @nd_arguments[nid] >= 0
+        ra_args = get_args(@nd_arguments[nid])
+        if ra_args.length == 2 && @nd_type[ra_args[1]] == "SymbolNode"
+          ra_op = @nd_content[ra_args[1]]
+          if ra_op == "+" || ra_op == "*" || ra_op == "-" || ra_op == "/" || ra_op == "%" || ra_op == "&" || ra_op == "|" || ra_op == "^"
+            return "({ sp_IntArray *_arr = " + rc + "; mrb_int _acc = " + compile_expr_as_int(ra_args[0]) + "; for (mrb_int _i = 0; _i < _arr->len; _i++) _acc = _acc " + ra_op + " sp_IntArray_get(_arr, _i); _acc; })"
+          end
+        end
+      end
       if mname == "to_a"
         return "sp_IntArray_dup(" + rc + ")"
       end
