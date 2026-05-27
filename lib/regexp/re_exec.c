@@ -194,10 +194,24 @@ add_thread(pike_state *s, re_threadlist *list,
       return;
 
     case RE_MATCH:
-      s->matched = TRUE;
+      /* Issue #909: pick the best match per Ruby semantics — earliest
+         start position wins; within the same start, longest length
+         (greedy) wins. The previous "last MATCH overwrites" rule got
+         greedy quantifiers right (`\w+` correctly extended the
+         match) but let a later-starting thread (like `\w\w`'s second
+         thread starting one byte later) clobber an earlier-starting
+         match's captures. */
       if (s->result_caps) {
-        memcpy(s->result_caps, CAP(s, cap_slot), sizeof(int) * s->ncap);
+        int *cap = CAP(s, cap_slot);
+        int new_start = cap[0], new_end = cap[1];
+        int cur_start = s->result_caps[0], cur_end = s->result_caps[1];
+        if (s->matched) {
+          if (new_start > cur_start) return;
+          if (new_start == cur_start && new_end <= cur_end) return;
+        }
+        memcpy(s->result_caps, cap, sizeof(int) * s->ncap);
       }
+      s->matched = TRUE;
       return;
 
     default:

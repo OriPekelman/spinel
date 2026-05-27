@@ -103,17 +103,21 @@ insert_inst(re_compiler *c, uint32_t pos, uint8_t op, uint8_t a, uint16_t offset
   c->code[pos].a = a;
   c->code[pos].offset = offset;
 
-  /* fix all jump targets that point at or past the insertion point.
-     Issue #824: previously only JMP/SPLIT/SPLITNG offsets were
-     patched, leaving LOOKAHEAD/NEG_LOOKAHEAD/LOOKBEHIND/NEG_LOOKBEHIND
-     dangling (their offset is the jump-to-end target). */
+  /* Fix jump targets that point past the insertion point. An offset equal
+     to `pos` already points to the inserted instruction's new location and
+     must not be bumped -- bumping it would shift the target to whatever
+     code got displaced by the insertion (e.g. the body of the quantified
+     atom), corrupting "skip past this atom" jumps emitted earlier.
+     Imported from mruby b9b8186f00.
+     Issue #824: also patches LOOKAHEAD/NEG_LOOKAHEAD/LOOKBEHIND/
+     NEG_LOOKBEHIND (their offset is the jump-to-end target). */
   for (uint32_t i = 0; i < c->code_len; i++) {
     if (i == pos) continue;
     switch (c->code[i].op) {
     case RE_JMP: case RE_SPLIT: case RE_SPLITNG:
     case RE_LOOKAHEAD: case RE_NEG_LOOKAHEAD:
     case RE_LOOKBEHIND: case RE_NEG_LOOKBEHIND:
-      if (c->code[i].offset >= pos && c->code[i].offset < 0xffff) {
+      if (c->code[i].offset > pos && c->code[i].offset < 0xffff) {
         c->code[i].offset++;
       }
       break;
@@ -971,12 +975,19 @@ first_set_walk(const re_inst *code, uint32_t code_len,
     case RE_ANY: case RE_ANY_NL:
       return FALSE;  /* any byte possible */
     case RE_MATCH:
-      return TRUE;  /* empty match; first_bytes still valid for other branches */
+      /* Reaching MATCH via epsilon transitions means the regex can match
+         zero characters at any position. Skipping bytes that aren't in the
+         first-byte set would skip past valid empty-match positions, so the
+         optimization isn't safe -- bail out and accept any starting byte.
+         Imported from mruby d21eceb286. */
+      return FALSE;
     default:
       return FALSE;
     }
   }
-  return TRUE;
+  /* Walked off the end without hitting MATCH or a consuming op. Treat as
+     empty-matchable, same as RE_MATCH. */
+  return FALSE;
 }
 
 static mrb_bool
