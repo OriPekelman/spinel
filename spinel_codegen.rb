@@ -14009,6 +14009,12 @@ class Compiler
         end
         return "((const char*)0)"
       end
+      if it_d == "GlobalVariableReadNode"
+ # CRuby returns "global-variable" whether the gvar has been
+ # assigned or not (gvars read as nil when unset, but the name
+ # itself is always "defined" syntactically).
+        return "\"global-variable\""
+      end
       if it_d == "CallNode" && @nd_receiver[inner_d] < 0
         mname_d = @nd_name[inner_d]
         if find_method_idx(mname_d) >= 0
