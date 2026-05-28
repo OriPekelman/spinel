@@ -26551,6 +26551,34 @@ class Compiler
         if cls_has_attr_reader(ci, mname) == 1
           return rc + arrow + sanitize_ivar(mname)
         end
+ # Struct#[] -- member access by symbol/string name or integer
+ # index. Resolves against the class's attr_reader list (the
+ # struct members, in declaration order). Gated on the class not
+ # defining its own `[]` so a user-defined bracket method wins.
+        if mname == "[]" && cls_find_method(ci, "[]") < 0
+          args_id_st = @nd_arguments[nid]
+          if args_id_st >= 0
+            a_st = get_args(args_id_st)
+            if a_st.length >= 1
+              readers_st = @cls_attr_readers[ci].split(";", -1)
+              fld_st = ""
+              if @nd_type[a_st[0]] == "SymbolNode" || @nd_type[a_st[0]] == "StringNode"
+                fld_st = @nd_content[a_st[0]]
+              elsif @nd_type[a_st[0]] == "IntegerNode"
+                idx_st = @nd_value[a_st[0]].to_i
+                if idx_st < 0
+                  idx_st = idx_st + readers_st.length
+                end
+                if idx_st >= 0 && idx_st < readers_st.length
+                  fld_st = readers_st[idx_st]
+                end
+              end
+              if fld_st != "" && cls_has_attr_reader(ci, fld_st) == 1
+                return rc + arrow + sanitize_ivar(fld_st)
+              end
+            end
+          end
+        end
  # attr_writer
         if mname.length > 1
           if mname[mname.length - 1] == "="

@@ -6026,6 +6026,36 @@ class Compiler
             if mr != "" && mr != "int"
               return mr
             end
+ # Struct#[] member access: when the class has no user `[]` but
+ # the index names/positions an attr_reader field, the result is
+ # that field's ivar type.
+            if cls_find_method(ci, "[]") < 0
+              args_id_st = @nd_arguments[nid]
+              if args_id_st >= 0
+                a_st = get_args(args_id_st)
+                if a_st.length >= 1
+                  readers_st = @cls_attr_readers[ci].split(";", -1)
+                  fld_st = ""
+                  if @nd_type[a_st[0]] == "SymbolNode" || @nd_type[a_st[0]] == "StringNode"
+                    fld_st = @nd_content[a_st[0]]
+                  elsif @nd_type[a_st[0]] == "IntegerNode"
+                    idx_st = @nd_value[a_st[0]].to_i
+                    if idx_st < 0
+                      idx_st = idx_st + readers_st.length
+                    end
+                    if idx_st >= 0 && idx_st < readers_st.length
+                      fld_st = readers_st[idx_st]
+                    end
+                  end
+                  if fld_st != ""
+                    ft_st = cls_ivar_type(ci, "@" + fld_st)
+                    if ft_st != ""
+                      return ft_st
+                    end
+                  end
+                end
+              end
+            end
           end
         end
       end
@@ -12753,6 +12783,27 @@ class Compiler
     if bodies.length > 0
       bodies[0] = "-2"
       @cls_meth_bodies[ci] = bodies.join(";")
+    end
+
+ # `Struct.new(:x, :y) do def to_s; ...; end end` — the block body
+ # adds instance methods to the struct class. Register each DefNode
+ # the same way a normal class body does so `pt.to_s` dispatches.
+    blk_st = @nd_block[call_nid]
+    if blk_st >= 0
+      bbody_st = @nd_body[blk_st]
+      if bbody_st >= 0
+        saved_ci_st = @current_class_idx
+        @current_class_idx = ci
+        blk_stmts_st = get_stmts(bbody_st)
+        bsi_st = 0
+        while bsi_st < blk_stmts_st.length
+          if @nd_type[blk_stmts_st[bsi_st]] == "DefNode"
+            collect_class_method(ci, blk_stmts_st[bsi_st])
+          end
+          bsi_st = bsi_st + 1
+        end
+        @current_class_idx = saved_ci_st
+      end
     end
   end
 
