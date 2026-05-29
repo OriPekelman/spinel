@@ -9873,6 +9873,17 @@ class Compiler
       else
         emit_gc_root_line("SP_GC_ROOT(" + expr + ");", raw)
       end
+    elsif kind == "poly"
+ # A poly (sp_RbVal) local/global can hold a heap string or object;
+ # root it via the low-bit-tagged slot so the GC marks through it
+ # with sp_mark_rbval (a plain pointer root would misread the tag
+ # word). Volatility (under setjmp) is applied at the declaration
+ # site and is orthogonal to rooting.
+      if global == 1
+        emit_gc_root_line("_sp_gc_root_push((void**)((uintptr_t)&" + expr + " | (uintptr_t)1));", raw)
+      else
+        emit_gc_root_line("SP_GC_ROOT_RBVAL(" + expr + ");", raw)
+      end
     elsif kind == "value_type"
       emit_value_type_field_roots(expr, t, raw, global)
     end
@@ -9895,6 +9906,21 @@ class Compiler
   end
 
   def emit_gc_root_for_expr(expr, t)
+    emit_gc_root_for_expr_impl(expr, t, 0, 0)
+  end
+
+ # Root a method parameter. Pointer / value-type params are rooted
+ # (as before); a poly param is NOT — its referent is reachable
+ # through the caller's own rooted slot, so re-rooting it in every
+ # callee only adds push/pop churn on hot call paths (measurably so
+ # in optcarrot) without protecting anything the caller doesn't.
+ # Poly *locals* assigned from a call ARE rooted (see #1052); a poly
+ # value passed straight into a call as a fresh temporary is the one
+ # uncovered shape, tracked separately.
+  def emit_gc_root_for_param(expr, t)
+    if gc_trace_kind(t) == "poly"
+      return 0
+    end
     emit_gc_root_for_expr_impl(expr, t, 0, 0)
   end
 
@@ -11705,7 +11731,7 @@ class Compiler
         j = 0
         while j < pnames.length
           if j < ptypes.length
-            emit_gc_root_for_expr("lv_" + pnames[j], ptypes[j])
+            emit_gc_root_for_param("lv_" + pnames[j], ptypes[j])
           end
           j = j + 1
         end
@@ -11779,7 +11805,7 @@ class Compiler
         j = 0
         while j < pnames.length
           if j < ptypes.length
-            emit_gc_root_for_expr("lv_" + pnames[j], ptypes[j])
+            emit_gc_root_for_param("lv_" + pnames[j], ptypes[j])
           end
           j = j + 1
         end
@@ -11822,7 +11848,7 @@ class Compiler
     has_gc_locals = 0
     j = 0
     while j < lnames.length
-      if type_needs_gc_root(ltypes[j]) == 1
+      if type_needs_gc_root(ltypes[j]) == 1 || gc_trace_kind(ltypes[j]) == "poly"
         has_gc_locals = 1
       end
       j = j + 1
@@ -12041,7 +12067,7 @@ class Compiler
         j = 0
         while j < pnames.length
           if j < ptypes.length
-            emit_gc_root_for_expr("lv_" + pnames[j], ptypes[j])
+            emit_gc_root_for_param("lv_" + pnames[j], ptypes[j])
           end
           j = j + 1
         end
@@ -12088,11 +12114,14 @@ class Compiler
       declare_var(lnames[j], ltypes[j])
       j = j + 1
     end
- # Emit declarations and GC rooting for pointer locals
+ # Emit declarations and GC rooting for pointer/poly locals. Poly
+ # (sp_RbVal) locals are rooted too (via the tagged-slot path in
+ # emit_gc_root_for_expr) so an object/string they hold survives a
+ # collection that fires while the local is still live.
     has_gc_locals = 0
     j = 0
     while j < lnames.length
-      if type_needs_gc_root(ltypes[j]) == 1
+      if type_needs_gc_root(ltypes[j]) == 1 || gc_trace_kind(ltypes[j]) == "poly"
         has_gc_locals = 1
       end
       j = j + 1
@@ -12811,6 +12840,13 @@ class Compiler
           vol = "volatile "
         end
         emit("  " + vol + ctp + " lv_" + lnames[j] + " = " + c_default_val(ltypes[j]) + ";")
+ # A poly local can carry a heap object/string; root it (the
+ # tagged-slot path marks through it via sp_mark_rbval). Kept in
+ # the volatile branch — under setjmp it stays volatile, which is
+ # orthogonal to and compatible with rooting.
+        if gc_trace_kind(ltypes[j]) == "poly"
+          emit_gc_root_for_expr("lv_" + lnames[j], ltypes[j])
+        end
       end
       j = j + 1
     end

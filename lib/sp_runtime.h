@@ -675,6 +675,16 @@ static inline void _sp_gc_root_pop(int *added) { if (*added) sp_gc_nroots--; }
 #define _SP_GC_CONCAT(a,b) _SP_GC_CONCAT2(a,b)
 #define SP_GC_SAVE() int __attribute__((cleanup(sp_gc_cleanup))) _gc_saved = sp_gc_nroots
 #define SP_GC_ROOT(v) int __attribute__((cleanup(_sp_gc_root_pop))) _SP_GC_CONCAT(_sp_gcr_, __COUNTER__) = _sp_gc_root_push((void**)&(v))
+/* Root a poly (sp_RbVal) local/global. The root stack stores void**
+   and marks *slot as a single GC pointer, but an sp_RbVal carries its
+   object pointer inside a union (offset != 0) and only when its tag is
+   STR/OBJ -- a blind *slot deref would read the tag word as a pointer.
+   So we tag the stored slot with the low bit (sp_RbVal addresses are
+   >=4-byte aligned, so the bit is free) and the mark walker, seeing the
+   tag, routes the entry through sp_mark_rbval instead. Same auto-pop
+   cleanup as SP_GC_ROOT, so SP_GC_SAVE/RESTORE and the fiber root
+   save/restore (which treat entries as opaque) need no changes. */
+#define SP_GC_ROOT_RBVAL(v) int __attribute__((cleanup(_sp_gc_root_pop))) _SP_GC_CONCAT(_sp_gcr_, __COUNTER__) = _sp_gc_root_push((void**)((uintptr_t)&(v) | (uintptr_t)1))
 #define SP_GC_RESTORE() sp_gc_nroots = _gc_saved
 #define SP_GC_MARK_STACK_MAX (1024*64)
 static void**sp_gc_mark_stack=NULL;static int sp_gc_mark_top=0;
@@ -701,7 +711,13 @@ static void sp_re_mark_globals(void);
    pointer stays NULL and sp_gc_mark_all skips the walk.
    Issue #636. */
 static void (*sp_gc_mark_suspended_fibers_hook)(void) = NULL;
-static void sp_gc_mark_all(void){if(!sp_gc_mark_stack)sp_gc_mark_stack=(void**)malloc(sizeof(void*)*SP_GC_MARK_STACK_MAX);sp_gc_mark_top=0;for(int i=0;i<sp_gc_nroots;i++){void*obj=*sp_gc_roots[i];if(obj)sp_gc_mark(obj);}if(sp_gc_mark_suspended_fibers_hook)sp_gc_mark_suspended_fibers_hook();sp_re_mark_globals();while(sp_gc_mark_top>0){void*obj=sp_gc_mark_stack[--sp_gc_mark_top];sp_gc_hdr*h=(sp_gc_hdr*)((char*)obj-sizeof(sp_gc_hdr));if(h->scan)h->scan(obj);}}
+/* Mark one root-stack entry. A low-bit-tagged entry is an sp_RbVal*
+   root (see SP_GC_ROOT_RBVAL) and routes through sp_mark_rbval, which
+   marks only its embedded STR/OBJ pointer; an untagged entry is a
+   plain void** whose target is a direct GC pointer. Defined after
+   sp_RbVal / sp_mark_rbval; forward-declared here. */
+static inline void sp_gc_mark_root_entry(void**e);
+static void sp_gc_mark_all(void){if(!sp_gc_mark_stack)sp_gc_mark_stack=(void**)malloc(sizeof(void*)*SP_GC_MARK_STACK_MAX);sp_gc_mark_top=0;for(int i=0;i<sp_gc_nroots;i++){void**e=sp_gc_roots[i];if((uintptr_t)e&(uintptr_t)1){sp_gc_mark_root_entry(e);}else{void*obj=*e;if(obj)sp_gc_mark(obj);}}if(sp_gc_mark_suspended_fibers_hook)sp_gc_mark_suspended_fibers_hook();sp_re_mark_globals();while(sp_gc_mark_top>0){void*obj=sp_gc_mark_stack[--sp_gc_mark_top];sp_gc_hdr*h=(sp_gc_hdr*)((char*)obj-sizeof(sp_gc_hdr));if(h->scan)h->scan(obj);}}
 static void sp_gc_cleanup(int*p){sp_gc_nroots=*p;}
 #define SP_GC_NBUCKETS 32
 static sp_gc_hdr*sp_gc_buckets[SP_GC_NBUCKETS];
@@ -2444,6 +2460,9 @@ static sp_RbVal sp_poly_neg(sp_RbVal a) { if (a.tag == SP_TAG_FLT) return sp_box
 /* PolyArray: array of sp_RbVal */
 typedef struct { sp_RbVal *data; mrb_int len; mrb_int cap; mrb_int frozen; } sp_PolyArray;
 static inline void sp_mark_rbval(sp_RbVal v);
+/* Definition of the root-entry marker forward-declared near
+   sp_gc_mark_all: a low-bit-tagged slot is an sp_RbVal* root. */
+static inline void sp_gc_mark_root_entry(void**e){uintptr_t u=(uintptr_t)e;if(u&(uintptr_t)1){sp_mark_rbval(*(sp_RbVal*)(u&~(uintptr_t)1));}else{void*o=*e;if(o)sp_gc_mark(o);}}
 static void sp_PolyArray_scan(void *p) { sp_PolyArray *a = (sp_PolyArray *)p; for (mrb_int i = 0; i < a->len; i++) sp_mark_rbval(a->data[i]); }
 static void sp_PolyArray_fin(void *p) { sp_PolyArray *a = (sp_PolyArray *)p; sp_gc_hdr *h = (sp_gc_hdr *)((char *)a - sizeof(sp_gc_hdr)); sp_gc_bytes -= sizeof(sp_RbVal) * a->cap; h->size -= sizeof(sp_RbVal) * a->cap; free(a->data); }
 static sp_PolyArray *sp_PolyArray_new(void) { sp_PolyArray *a = (sp_PolyArray *)sp_gc_alloc(sizeof(sp_PolyArray), sp_PolyArray_fin, sp_PolyArray_scan); a->cap = 16; a->data = (sp_RbVal *)malloc(sizeof(sp_RbVal) * a->cap); if (!a->data) sp_oom_die(); a->len = 0; { sp_gc_hdr *h = (sp_gc_hdr *)((char *)a - sizeof(sp_gc_hdr)); h->size += sizeof(sp_RbVal) * a->cap; sp_gc_bytes += sizeof(sp_RbVal) * a->cap; } return a; }
@@ -3612,7 +3631,7 @@ static void sp_fiber_list_remove(sp_Fiber*f){if(f->fiber_prev)f->fiber_prev->fib
    sp_fiber_root.saved_roots (the resume side stashed them there)
    but sp_fiber_root is NOT in sp_fiber_list_head, so walking the
    list alone would miss them and free main's live locals. */
-static void sp_mark_fiber_roots(sp_Fiber*f){if(f==sp_fiber_current)return;int i;for(i=0;i<f->saved_nroots;i++){void*obj=*f->saved_roots[i];if(obj)sp_gc_mark(obj);}}
+static void sp_mark_fiber_roots(sp_Fiber*f){if(f==sp_fiber_current)return;int i;for(i=0;i<f->saved_nroots;i++){void**e=f->saved_roots[i];if((uintptr_t)e&(uintptr_t)1){sp_gc_mark_root_entry(e);}else{void*obj=*e;if(obj)sp_gc_mark(obj);}}}
 static void sp_mark_suspended_fibers(void){sp_mark_fiber_roots(&sp_fiber_root);sp_Fiber*f=sp_fiber_list_head;while(f){sp_mark_fiber_roots(f);f=f->fiber_next;}}
 static void sp_fiber_install_gc_hook(void){if(!sp_gc_mark_suspended_fibers_hook)sp_gc_mark_suspended_fibers_hook=sp_mark_suspended_fibers;}
 static void sp_Fiber_fin(void*p){sp_Fiber*f=(sp_Fiber*)p;if(f->ctx)DeleteFiber(f->ctx);if(f->saved_roots)free(f->saved_roots);sp_fiber_list_remove(f);}
@@ -3648,7 +3667,7 @@ static void sp_fiber_list_remove(sp_Fiber*f){if(f->fiber_prev)f->fiber_prev->fib
    sp_fiber_root.saved_roots (the resume side stashed them there)
    but sp_fiber_root is NOT in sp_fiber_list_head, so walking the
    list alone would miss them and free main's live locals. */
-static void sp_mark_fiber_roots(sp_Fiber*f){if(f==sp_fiber_current)return;int i;for(i=0;i<f->saved_nroots;i++){void*obj=*f->saved_roots[i];if(obj)sp_gc_mark(obj);}}
+static void sp_mark_fiber_roots(sp_Fiber*f){if(f==sp_fiber_current)return;int i;for(i=0;i<f->saved_nroots;i++){void**e=f->saved_roots[i];if((uintptr_t)e&(uintptr_t)1){sp_gc_mark_root_entry(e);}else{void*obj=*e;if(obj)sp_gc_mark(obj);}}}
 static void sp_mark_suspended_fibers(void){sp_mark_fiber_roots(&sp_fiber_root);sp_Fiber*f=sp_fiber_list_head;while(f){sp_mark_fiber_roots(f);f=f->fiber_next;}}
 static void sp_fiber_install_gc_hook(void){if(!sp_gc_mark_suspended_fibers_hook)sp_gc_mark_suspended_fibers_hook=sp_mark_suspended_fibers;}
 static void sp_Fiber_fin(void*p){sp_Fiber*f=(sp_Fiber*)p;if(f->stack)munmap(f->stack,SP_FIBER_STACK_SIZE);if(f->saved_roots)free(f->saved_roots);sp_fiber_list_remove(f);}
