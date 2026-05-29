@@ -199,15 +199,19 @@ static mrb_int sp_int_clamp(mrb_int v,mrb_int lo,mrb_int hi){return v<lo?lo:v>hi
 static mrb_int sp_int_sqrt(mrb_int n){if(n<0)return 0;if(n<2)return n;mrb_int x=n,y=(x+1)/2;while(y<x){x=y;y=(x+n/x)/2;}return x;}
 static inline char *sp_str_alloc_raw(size_t total_with_null);  /* fwd decl */
 static const char*sp_int_chr(mrb_int n){char*s=sp_str_alloc_raw(2);s[0]=(char)n;s[1]=0;return s;}
-/* Integer#round(ndigits): round to nearest 10^(-ndigits).
-   Integer#ceil(ndigits): round up to 10^(-ndigits).
-   Integer#floor(ndigits): round down to 10^(-ndigits).
-   Integer#truncate(ndigits): truncate toward zero at 10^(-ndigits).
-   Positive ndigits are a no-op on integers. */
-static mrb_int sp_int_round(mrb_int v,mrb_int nd){if(nd>=0)return v;mrb_int f=(mrb_int)pow(10,-nd);return(mrb_int)round((double)v/f)*f;}
-static mrb_int sp_int_ceil(mrb_int v,mrb_int nd){if(nd>=0)return v;mrb_int f=(mrb_int)pow(10,-nd);return(mrb_int)ceil((double)v/f)*f;}
-static mrb_int sp_int_floor(mrb_int v,mrb_int nd){if(nd>=0)return v;mrb_int f=(mrb_int)pow(10,-nd);return(mrb_int)floor((double)v/f)*f;}
-static mrb_int sp_int_truncate(mrb_int v,mrb_int nd){if(nd>=0)return v;mrb_int f=(mrb_int)pow(10,-nd);return(v>=0?(mrb_int)floor((double)v/f):(mrb_int)ceil((double)v/f))*f;}
+/* Integer#round(ndigits): round to nearest 10^(-ndigits) (half away
+   from zero). Integer#ceil/floor/truncate at 10^(-ndigits). Positive
+   ndigits are a no-op on integers. Pure integer arithmetic: converting
+   to double would lose precision above 2^53, and casting pow(10,-nd)
+   to mrb_int is undefined once 10^(-nd) exceeds MRB_INT_MAX (-nd>=19).
+   10^p fits mrb_int only for p<=18, so p>=19 collapses to 0 (the exact
+   result is unrepresentable in 64-bit); the round-up multiply is
+   overflow-guarded and falls back to the truncated value. */
+static mrb_int sp_ipow10(mrb_int p){mrb_int f=1;mrb_int i=0;while(i<p){f*=10;i++;}return f;}
+static mrb_int sp_int_round(mrb_int v,mrb_int nd){if(nd>=0)return v;mrb_int p=-nd;if(p>=19)return 0;mrb_int f=sp_ipow10(p);mrb_int q=v/f,r=v%f,half=f/2;if(v>=0){if(r>=half&&q<INT64_MAX/f)return(q+1)*f;return q*f;}if(-r>=half&&q>INT64_MIN/f)return(q-1)*f;return q*f;}
+static mrb_int sp_int_ceil(mrb_int v,mrb_int nd){if(nd>=0)return v;mrb_int p=-nd;if(p>=19)return 0;mrb_int f=sp_ipow10(p);mrb_int q=v/f,r=v%f;if(r!=0&&v>0&&q<INT64_MAX/f)return(q+1)*f;return q*f;}
+static mrb_int sp_int_floor(mrb_int v,mrb_int nd){if(nd>=0)return v;mrb_int p=-nd;if(p>=19)return 0;mrb_int f=sp_ipow10(p);mrb_int q=v/f,r=v%f;if(r!=0&&v<0&&q>INT64_MIN/f)return(q-1)*f;return q*f;}
+static mrb_int sp_int_truncate(mrb_int v,mrb_int nd){if(nd>=0)return v;mrb_int p=-nd;if(p>=19)return 0;mrb_int f=sp_ipow10(p);return(v/f)*f;}
 
 /* Forward decls for helpers used across this header (and by the
    string->number parsers that now live in libspinel_rt.a). */
