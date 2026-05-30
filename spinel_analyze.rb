@@ -3064,6 +3064,11 @@ class Compiler
           if all_sym_keys == 1 && (first_vt == "int" || first_vt == "bool" || first_vt == "nil")
             return "sym_int_hash"
           end
+ # Int keys with int values -> int_int_hash (mirrors the sym_int_hash
+ # case above; bigint values unbox to mrb_int the same way).
+          if all_int_keys == 1 && (first_vt == "int" || first_vt == "bool" || first_vt == "nil" || first_vt == "bigint")
+            return "int_int_hash"
+          end
  # promote-mode bigint values map onto sym_int_hash storage by
  # unboxing each bigint via sp_bigint_to_int at the codegen
  # set/get sites (mirrors the codegen-side infer_hash_val_type).
@@ -7763,7 +7768,7 @@ class Compiler
     if t == "str_int_hash" || t == "str_str_hash" || t == "int_str_hash"
       return 1
     end
-    if t == "sym_int_hash" || t == "sym_str_hash"
+    if t == "sym_int_hash" || t == "sym_str_hash" || t == "int_int_hash"
       return 1
     end
     if t == "str_poly_hash" || t == "sym_poly_hash"
@@ -7777,7 +7782,7 @@ class Compiler
 
 
   def hash_leaf_type(recv_type)
-    if recv_type == "str_int_hash" || recv_type == "sym_int_hash"
+    if recv_type == "str_int_hash" || recv_type == "sym_int_hash" || recv_type == "int_int_hash"
       return "int"
     end
     if recv_type == "str_str_hash" || recv_type == "sym_str_hash" || recv_type == "int_str_hash"
@@ -12710,6 +12715,11 @@ class Compiler
     if int_keys && str_vals
       return "int_str_hash"
     end
+ # int_keys && int_vals: an empty-`{}` slot refined from observed
+ # writes would promote the decl to int_int_hash without the
+ # construction / write sites following, so leave it to the poly
+ # fallback. int-keyed-int-valued hash *literals* are handled
+ # directly by infer_hash_val_type.
  # Fall back to poly when the observed pair doesn't fit a typed hash.
     if sym_keys
       return "sym_poly_hash"
@@ -18467,17 +18477,15 @@ class Compiler
       if vt == "string"
         return "int_str_hash"
       end
- # `kt == "int"` with `vt == "int"` is ambiguous: it could be a
- # real int-keyed-int-valued hash (no native variant, would go
- # to poly_poly_hash), OR it could be the analyzer's fallback
- # when the key expression's type couldn't be resolved on the
- # first pass (e.g. `parts[0]` where `parts` isn't declared
- # yet). Promoting to poly_poly_hash here is destructive: a
- # later pass that correctly resolves the key as "string" can't
- # downgrade poly_poly_hash back to str_int_hash. Defer to the
- # next pass instead. Non-int vt (array, obj, etc.) still
- # routes through the catch-all below since those are
- # unambiguous "real concrete write" signals.
+ # `kt == "int"` with `vt == "int"` would map to int_int_hash, but
+ # promoting an empty-`{}` local/ivar here is incomplete: the slot's
+ # decl is updated while the `{}` construction and `[]=` write sites
+ # still emit the str_int_hash default (the promotion doesn't
+ # propagate to the RHS), yielding a type-mismatched build. It is
+ # also ambiguous with the analyzer's first-pass "int" fallback for
+ # an unresolved key expression. Defer; int-keyed-int-valued hash
+ # *literals* (`{1 => 2}`) are inferred directly by
+ # infer_hash_val_type and don't rely on this promotion.
       if vt == "int" || vt == "bool" || vt == "nil"
         return ""
       end

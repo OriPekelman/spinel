@@ -4225,6 +4225,11 @@ class Compiler
           if all_sym_keys == 1 && (first_vt == "int" || first_vt == "bigint" || first_vt == "bool" || first_vt == "nil")
             return "sym_int_hash"
           end
+ # Int keys with int values -> int_int_hash (mirrors the sym_int_hash
+ # case above; bigint values unbox to mrb_int the same way).
+          if all_int_keys == 1 && (first_vt == "int" || first_vt == "bigint" || first_vt == "bool" || first_vt == "nil")
+            return "int_int_hash"
+          end
  # Symbol values get sym_poly_hash storage so dig / lookup
  # preserves the SP_TAG_SYM tag. Issue #555 case 07.
           if all_sym_keys == 1 && first_vt == "symbol"
@@ -5707,7 +5712,7 @@ class Compiler
   end
 
   def hash_leaf_type(recv_type)
-    if recv_type == "str_int_hash" || recv_type == "sym_int_hash"
+    if recv_type == "str_int_hash" || recv_type == "sym_int_hash" || recv_type == "int_int_hash"
       return "int"
     end
     if recv_type == "str_str_hash" || recv_type == "sym_str_hash" || recv_type == "int_str_hash"
@@ -5752,6 +5757,7 @@ class Compiler
     if t == "str_int_hash";  return ["int", "mrb_int", "sp_StrIntHash_has_key", "sp_StrIntHash_get"]; end
     if t == "str_str_hash";  return ["string", "const char *", "sp_StrStrHash_has_key", "sp_StrStrHash_get"]; end
     if t == "str_poly_hash"; return ["poly", "sp_RbVal", "sp_StrPolyHash_has_key", "sp_StrPolyHash_get"]; end
+    if t == "int_int_hash";  return ["int", "mrb_int", "sp_IntIntHash_has_key", "sp_IntIntHash_get"]; end
     nil
   end
 
@@ -7907,6 +7913,9 @@ class Compiler
       @needs_int_str_hash = 1
       return "sp_IntStrHash_new()"
     end
+    if pt == "int_int_hash"
+      return "sp_IntIntHash_new()"
+    end
     if pt == "poly_poly_hash"
       @needs_poly_poly_hash = 1
       return "sp_PolyPolyHash_new()"
@@ -7943,6 +7952,9 @@ class Compiler
       @needs_int_str_hash = 1
       return "int_str_hash"
     end
+ # int+int empty-hash refinement is left to the poly fallback (the
+ # decl would promote without the construction following); int-keyed
+ # int-valued hash literals are built directly by compile_hash_literal.
     @needs_poly_poly_hash = 1
     return "poly_poly_hash"
   end
@@ -32866,6 +32878,22 @@ class Compiler
       }
       return tmp
     end
+    if ht == "int_int_hash"
+      tmp = new_temp
+      emit("  sp_IntIntHash *" + tmp + " = sp_IntIntHash_new();")
+      emit("  SP_GC_ROOT(" + tmp + ");")
+      elems.each { |el|
+        if @nd_type[el] == "AssocNode"
+          v_iih = compile_expr(@nd_expression[el])
+          if infer_type(@nd_expression[el]) == "bigint"
+            @needs_bigint = 1
+            v_iih = "sp_bigint_to_int((sp_Bigint *)" + v_iih + ")"
+          end
+          emit("  sp_IntIntHash_set(" + tmp + ", " + compile_expr(@nd_key[el]) + ", " + v_iih + ");")
+        end
+      }
+      return tmp
+    end
     if ht == "poly_poly_hash"
  # Mixed-shape keys (e.g. `{ 0 => false, a: 1 }`). Both key
  # and value carry their own tag; box each at the assoc site.
@@ -36339,6 +36367,10 @@ class Compiler
               emit("  sp_IntStrHash_set(" + rc + ", " + compile_expr(aargs[0]) + ", " + val + ");")
               return 1
             end
+            if rt == "int_int_hash"
+              emit("  sp_IntIntHash_set(" + rc + ", " + compile_expr(aargs[0]) + ", " + val + ");")
+              return 1
+            end
             key = compile_expr_as_string(aargs[0])
             if rt == "str_int_hash"
               emit("  sp_StrIntHash_set(" + rc + ", " + key + ", " + val + ");")
@@ -39223,6 +39255,11 @@ class Compiler
     end
     if rt == "int_str_hash"
       emit("  sp_IntStrHash_set(" + rc + ", " + idx + ", " + val + ");")
+      return
+    end
+    if rt == "int_int_hash"
+      val_iih = compile_expr_as_int(arg_ids[1])
+      emit("  sp_IntIntHash_set(" + rc + ", " + idx + ", " + val_iih + ");")
       return
     end
  # str_int_hash / str_str_hash were both missing here previously,
