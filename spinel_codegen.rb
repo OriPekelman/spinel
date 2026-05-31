@@ -20716,15 +20716,7 @@ class Compiler
         return "sp_StrIntHash_new()"
       end
       if cname == "StringIO"
-        @needs_stringio = 1
-        args_id = @nd_arguments[nid]
-        if args_id >= 0
-          aargs = get_args(args_id)
-          if aargs.length >= 1
-            return "sp_StringIO_new_s(" + compile_expr(aargs.first) + ")"
-          end
-        end
-        return "sp_StringIO_new()"
+        return compile_stringio_construct(nid)
       end
  # `Object.new` — a sentinel allocation. Each call returns a fresh
  # GC-managed pointer so identity comparisons (`==` / `equal?`)
@@ -20763,6 +20755,28 @@ class Compiler
       end
     end
     ""
+  end
+
+ # Build the C expression that constructs a StringIO from a call's args
+ # (used by both StringIO.new and StringIO.open). The first positional
+ # arg is the initial string; a second positional string arg is the mode
+ # (sp_StringIO_new_sm honours "w"/"a"). A trailing keyword hash is not a
+ # positional arg. A non-string second arg (e.g. an integer mode) is
+ # ignored and the plain string constructor is used.
+  def compile_stringio_construct(nid)
+    @needs_stringio = 1
+    args_id = @nd_arguments[nid]
+    if args_id >= 0
+      aargs = get_args(args_id)
+      if aargs.length >= 2 && @nd_type[aargs[1]] != "KeywordHashNode" &&
+         (@nd_type[aargs[1]] == "StringNode" || base_type(infer_type(aargs[1])) == "string")
+        return "sp_StringIO_new_sm(" + compile_expr(aargs[0]) + ", " + compile_expr(aargs[1]) + ")"
+      end
+      if aargs.length >= 1 && @nd_type[aargs[0]] != "KeywordHashNode"
+        return "sp_StringIO_new_s(" + compile_expr(aargs[0]) + ")"
+      end
+    end
+    "sp_StringIO_new()"
   end
 
   def compile_stringio_method_expr(nid, mname, rc)

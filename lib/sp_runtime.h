@@ -3769,6 +3769,20 @@ static void sio_grow(sp_StringIO *sio, int64_t need) { int64_t req = sio->pos + 
 static int64_t sio_write(sp_StringIO *sio, const char *d, int64_t dl) { sio_grow(sio, dl); if (sio->pos > sio->len) memset(sio->buf + sio->len, 0, sio->pos - sio->len); memcpy(sio->buf + sio->pos, d, dl); sio->pos += dl; if (sio->pos > sio->len) sio->len = sio->pos; sio->buf[sio->len] = '\0'; return dl; }
 static sp_StringIO *sp_StringIO_new(void) { sp_StringIO *s = (sp_StringIO *)calloc(1, sizeof(sp_StringIO)); s->buf = (char *)calloc(1, 64); s->cap = 63; return s; }
 static sp_StringIO *sp_StringIO_new_s(const char *init) { if (!init) sp_raise_cls("TypeError", "no implicit conversion of nil into String"); sp_StringIO *s = (sp_StringIO *)calloc(1, sizeof(sp_StringIO)); int64_t l = (int64_t)strlen(init); int64_t c = l < 63 ? 63 : l; s->buf = (char*)malloc(c+1); memcpy(s->buf, init, l); s->buf[l]='\0'; s->len = l; s->cap = c; return s; }
+/* StringIO.new(str, mode): the mode's first char selects the initial
+   content/position. "w"/"w+" truncate to empty; "a"/"a+" keep the
+   content and seek to the end (subsequent writes append); "r"/"r+" and
+   anything else keep the content at position 0. Read-only enforcement
+   ("r" rejecting writes) is not modelled. */
+static sp_StringIO *sp_StringIO_new_sm(const char *init, const char *mode) {
+  if (!init) sp_raise_cls("TypeError", "no implicit conversion of nil into String");
+  if (!mode || !mode[0]) return sp_StringIO_new_s(init);
+  char m0 = mode[0];
+  if (m0 == 'w') return sp_StringIO_new();
+  sp_StringIO *s = sp_StringIO_new_s(init);
+  if (m0 == 'a') s->pos = s->len;
+  return s;
+}
 static const char *sp_StringIO_string(sp_StringIO *s) { return s->buf ? s->buf : sp_str_empty; }
 static int64_t sp_StringIO_pos(sp_StringIO *s) { return s->pos; }
 static int64_t sp_StringIO_size(sp_StringIO *s) { return s->len; }
