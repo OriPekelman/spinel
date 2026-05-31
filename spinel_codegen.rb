@@ -23974,6 +23974,54 @@ class Compiler
         emit("  }")
         return tmp
       end
+ # Same matrix transpose for [[Str]] / [[Float]] nested arrays:
+ # build one column array per inner index, collecting element [i][j].
+      if mname == "transpose" && elem_type == "str_array"
+        @needs_str_array = 1
+        @needs_gc = 1
+        tmp = new_temp
+        col = new_temp
+        itmp = new_temp
+        jtmp = new_temp
+        cols = new_temp
+        emit("  sp_PtrArray *" + tmp + " = sp_PtrArray_new();")
+        emit("  SP_GC_ROOT(" + tmp + ");")
+        emit("  if (sp_PtrArray_length(" + rc + ") > 0) {")
+        emit("    mrb_int " + cols + " = sp_StrArray_length((sp_StrArray *)sp_PtrArray_get(" + rc + ", 0));")
+        emit("    for (mrb_int " + jtmp + " = 0; " + jtmp + " < " + cols + "; " + jtmp + "++) {")
+        emit("      sp_StrArray *" + col + " = sp_StrArray_new();")
+        emit("      SP_GC_ROOT(" + col + ");")
+        emit("      for (mrb_int " + itmp + " = 0; " + itmp + " < sp_PtrArray_length(" + rc + "); " + itmp + "++) {")
+        emit("        sp_StrArray_push(" + col + ", sp_StrArray_get((sp_StrArray *)sp_PtrArray_get(" + rc + ", " + itmp + "), " + jtmp + "));")
+        emit("      }")
+        emit("      sp_PtrArray_push(" + tmp + ", " + col + ");")
+        emit("    }")
+        emit("  }")
+        return tmp
+      end
+      if mname == "transpose" && elem_type == "float_array"
+        @needs_float_array = 1
+        @needs_gc = 1
+        tmp = new_temp
+        col = new_temp
+        itmp = new_temp
+        jtmp = new_temp
+        cols = new_temp
+        emit("  sp_PtrArray *" + tmp + " = sp_PtrArray_new();")
+        emit("  SP_GC_ROOT(" + tmp + ");")
+        emit("  if (sp_PtrArray_length(" + rc + ") > 0) {")
+        emit("    mrb_int " + cols + " = sp_FloatArray_length((sp_FloatArray *)sp_PtrArray_get(" + rc + ", 0));")
+        emit("    for (mrb_int " + jtmp + " = 0; " + jtmp + " < " + cols + "; " + jtmp + "++) {")
+        emit("      sp_FloatArray *" + col + " = sp_FloatArray_new();")
+        emit("      SP_GC_ROOT(" + col + ");")
+        emit("      for (mrb_int " + itmp + " = 0; " + itmp + " < sp_PtrArray_length(" + rc + "); " + itmp + "++) {")
+        emit("        sp_FloatArray_push(" + col + ", sp_FloatArray_get((sp_FloatArray *)sp_PtrArray_get(" + rc + ", " + itmp + "), " + jtmp + "));")
+        emit("      }")
+        emit("      sp_PtrArray_push(" + tmp + ", " + col + ");")
+        emit("    }")
+        emit("  }")
+        return tmp
+      end
     end
     if recv_type == "str_array"
       if mname == "length"
