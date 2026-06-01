@@ -333,6 +333,14 @@ class Compiler
  # with individual scalar locals. Distinct from value_type: SRA allows
  # attr_writer (mutation is rewritten to per-field assignment).
     @cls_is_sra = []
+ # Direct `Class.new` allocation sites that were cloned into a
+ # per-site class by collect_implicit_new_specializations. The
+ # source syntax stays ordinary Ruby; inference sees the cloned
+ # class so ivar/method tables can specialize independently.
+    @implicit_new_site_ids = []
+    @implicit_new_site_classes = "".split(",", -1)
+    @implicit_new_local_names = "".split(",", -1)
+    @implicit_new_local_classes = "".split(",", -1)
 
  # ---- Constants (parallel arrays) ----
     @const_names = "".split(",", -1)
@@ -882,6 +890,34 @@ class Compiler
       return resolve_const_ref_name(recv_nid)
     end
     ""
+  end
+
+  def implicit_new_site_class(nid)
+    k = 0
+    while k < @implicit_new_site_ids.length
+      if @implicit_new_site_ids[k] == nid
+        return @implicit_new_site_classes[k]
+      end
+      k = k + 1
+    end
+    ""
+  end
+
+  def implicit_new_local_class(name)
+    result = ""
+    k = 0
+    while k < @implicit_new_local_names.length
+      if @implicit_new_local_names[k] == name
+        cls = @implicit_new_local_classes[k]
+        if result == ""
+          result = cls
+        elsif result != cls
+          return ""
+        end
+      end
+      k = k + 1
+    end
+    result
   end
 
   def module_name_exists(name)
@@ -2328,6 +2364,10 @@ class Compiler
       vt = find_var_type(@nd_name[nid])
       if vt != ""
         return vt
+      end
+      implicit_cls = implicit_new_local_class(@nd_name[nid])
+      if implicit_cls != ""
+        return "obj_" + implicit_cls
       end
       return "int"
     end
@@ -6671,6 +6711,10 @@ class Compiler
 
   def infer_constructor_type(nid, mname, recv)
     if mname == "new"
+      spec_cname = implicit_new_site_class(nid)
+      if spec_cname != ""
+        return "obj_" + spec_cname
+      end
  # Implicit recv-less `new` in a class method body resolves
  # to `obj_<CurrentClass>` so subsequent attr_writer calls
  # and ivar widening see the right type.
@@ -8481,6 +8525,12 @@ class Compiler
  # (last-include-wins); user-defined top-level `def`s are preserved.
  # Must run after module-function entries are registered.
     collect_toplevel_module_includes
+
+ # Pass 2.55: clone direct allocation sites for classes with
+ # empty-array ivar initialization before receiver-method prepasses
+ # can merge sibling instances into one class table.
+    collect_implicit_new_specializations
+
  # Pass 2.6: hoist `recv.instance_eval do ... end` blocks into
  # file-scope static functions. Receiver-class flow analysis picks the
  # receiver's class, the block body is later compiled as a function
@@ -9181,6 +9231,285 @@ class Compiler
       collect_cvars_in(cs[k], class_idx)
       k = k + 1
     end
+  end
+
+  def node_contains_empty_array_ivar_write(nid)
+    if nid < 0
+      return 0
+    end
+    t = @nd_type[nid]
+    if t == "DefNode" || t == "ClassNode" || t == "ModuleNode" || t == "SingletonClassNode"
+      return 0
+    end
+    if t == "InstanceVariableWriteNode"
+      if is_empty_array_literal(@nd_expression[nid]) == 1
+        return 1
+      end
+    end
+    cs = []
+    push_child_ids(nid, cs)
+    k = 0
+    while k < cs.length
+      if node_contains_empty_array_ivar_write(cs[k]) == 1
+        return 1
+      end
+      k = k + 1
+    end
+    0
+  end
+
+  def implicit_specializable_class?(ci)
+    if ci < 0 || ci >= @cls_names.length
+      return 0
+    end
+    if @cls_is_value_type[ci] == 1
+      return 0
+    end
+    init_idx = cls_find_method_direct(ci, "initialize")
+    if init_idx < 0
+      return 0
+    end
+    bodies = @cls_meth_bodies[ci].split(";", -1)
+    if init_idx >= bodies.length
+      return 0
+    end
+    bid = bodies[init_idx].to_i
+    if bid < 0
+      return 0
+    end
+    node_contains_empty_array_ivar_write(bid)
+  end
+
+  def collect_implicit_new_site_candidates(nid, site_ids, site_classes)
+    if nid < 0
+      return
+    end
+    if @nd_type[nid] == "CallNode" && @nd_name[nid] == "new"
+      recv = @nd_receiver[nid]
+      if recv >= 0
+        cname = constructor_class_name(recv)
+        if cname != ""
+          ci = find_class_idx(cname)
+          if ci >= 0
+            args_id = @nd_arguments[nid]
+            argc = 0
+            if args_id >= 0
+              argc = get_args(args_id).length
+            end
+            if argc == 0
+              site_ids.push(nid)
+              site_classes.push(cname)
+            end
+          end
+        end
+      end
+    end
+    cs = []
+    push_child_ids(nid, cs)
+    k = 0
+    while k < cs.length
+      collect_implicit_new_site_candidates(cs[k], site_ids, site_classes)
+      k = k + 1
+    end
+  end
+
+  def count_implicit_new_sites_for_class(site_classes, cname)
+    count = 0
+    k = 0
+    while k < site_classes.length
+      if site_classes[k] == cname
+        count = count + 1
+      end
+      k = k + 1
+    end
+    count
+  end
+
+  def copy_cls_rest_entries_for_implicit_specialization(old_name, new_name)
+    prefix = old_name + "#"
+    plen = prefix.length
+    k = 0
+    while k < @cls_rest_keys.length
+      key = @cls_rest_keys[k]
+      if key.length > plen && key[0, plen] == prefix
+        @cls_rest_keys.push(new_name + "#" + key[plen, key.length - plen])
+        @cls_rest_idxs.push(@cls_rest_idxs[k])
+      end
+      k = k + 1
+    end
+  end
+
+  def clone_class_slot_for_implicit_new(template_ci, spec_name)
+    old_name = @cls_names[template_ci]
+    @cls_names.push(spec_name)
+    @cls_parents.push(@cls_parents[template_ci])
+    @cls_includes.push(@cls_includes[template_ci])
+    @cls_ivar_names.push(@cls_ivar_names[template_ci])
+    @cls_ivar_types.push(@cls_ivar_types[template_ci])
+    @cls_ivar_init_definite.push(@cls_ivar_init_definite[template_ci])
+    @cls_ivar_observed_types.push(@cls_ivar_observed_types[template_ci])
+    @cls_ivar_rbs_types.push(@cls_ivar_rbs_types[template_ci])
+    @cls_ivar_nil_checked.push(@cls_ivar_nil_checked[template_ci])
+    @cls_meth_names.push(@cls_meth_names[template_ci])
+    @cls_meth_params.push(@cls_meth_params[template_ci])
+    @cls_meth_ptypes.push(@cls_meth_ptypes[template_ci])
+    @cls_meth_returns.push(@cls_meth_returns[template_ci])
+    @cls_meth_bodies.push(@cls_meth_bodies[template_ci])
+    @cls_meth_defaults.push(@cls_meth_defaults[template_ci])
+    @cls_meth_ptypes_empty.push(@cls_meth_ptypes_empty[template_ci])
+    @cls_meth_prep_chain.push(@cls_meth_prep_chain[template_ci])
+    @cls_attr_readers.push(@cls_attr_readers[template_ci])
+    @cls_attr_writers.push(@cls_attr_writers[template_ci])
+    @cls_cmeth_names.push(@cls_cmeth_names[template_ci])
+    @cls_cmeth_params.push(@cls_cmeth_params[template_ci])
+    @cls_cmeth_ptypes.push(@cls_cmeth_ptypes[template_ci])
+    @cls_cmeth_returns.push(@cls_cmeth_returns[template_ci])
+    @cls_cmeth_bodies.push(@cls_cmeth_bodies[template_ci])
+    @cls_cmeth_defaults.push(@cls_cmeth_defaults[template_ci])
+    @cls_cmeth_scope_names.push(@cls_cmeth_scope_names[template_ci])
+    @cls_cmeth_scope_types.push(@cls_cmeth_scope_types[template_ci])
+    @cls_is_value_type.push(@cls_is_value_type[template_ci])
+    @cls_is_sra.push(@cls_is_sra[template_ci])
+    @cls_meth_has_yield.push(@cls_meth_has_yield[template_ci])
+    copy_cls_rest_entries_for_implicit_specialization(old_name, spec_name)
+    @cls_ivar_types_version = @cls_ivar_types_version + 1
+    @cls_meth_ptypes_version = @cls_meth_ptypes_version + 1
+    @cls_meth_params_version = @cls_meth_params_version + 1
+    @cls_cmeth_ptypes_version = @cls_cmeth_ptypes_version + 1
+    @cls_cmeth_params_version = @cls_cmeth_params_version + 1
+  end
+
+  def collect_implicit_new_local_bindings(nid)
+    if nid < 0
+      return
+    end
+    if @nd_type[nid] == "LocalVariableWriteNode"
+      expr = @nd_expression[nid]
+      cls = implicit_new_site_class(expr)
+      if cls != ""
+        @implicit_new_local_names.push(@nd_name[nid])
+        @implicit_new_local_classes.push(cls)
+      end
+    end
+    cs = []
+    push_child_ids(nid, cs)
+    k = 0
+    while k < cs.length
+      collect_implicit_new_local_bindings(cs[k])
+      k = k + 1
+    end
+  end
+
+  def rewrite_implicit_new_ivar_init_type(ci, iname, spec_name)
+    if ci < 0 || ci >= @cls_names.length
+      return
+    end
+    names = @cls_ivar_names[ci].split(";", -1)
+    types = @cls_ivar_types[ci].split(";", -1)
+    changed = 0
+    k = 0
+    while k < names.length
+      if names[k] == iname
+        spec_t = "obj_" + spec_name
+        base_name = spec_name
+        marker = "__implicit_"
+        mark_idx = base_name.index(marker)
+        if mark_idx
+          base_name = base_name[0, mark_idx]
+        end
+        base_t = "obj_" + base_name
+        if k >= types.length
+          while types.length <= k
+            types.push("int")
+          end
+        end
+        if types[k] == base_t || types[k] == "int"
+          types[k] = spec_t
+          changed = 1
+        end
+      end
+      k = k + 1
+    end
+    if changed == 1
+      @cls_ivar_types[ci] = types.join(";")
+      @cls_ivar_types_version = @cls_ivar_types_version + 1
+    end
+  end
+
+  def normalize_implicit_new_ivar_inits(nid, class_idx, module_prefix)
+    if nid < 0
+      return
+    end
+    t = @nd_type[nid]
+    if t == "ModuleNode"
+      mname = ""
+      cp = @nd_constant_path[nid]
+      if cp >= 0
+        mname = const_ref_flat_name(cp)
+        if module_prefix != "" && const_ref_is_relative(cp) == 1
+          mname = module_prefix + "_" + mname
+        end
+      end
+      normalize_implicit_new_ivar_inits(@nd_body[nid], -1, mname)
+      return
+    end
+    if t == "ClassNode"
+      cname = ""
+      cp = @nd_constant_path[nid]
+      if cp >= 0
+        cname = const_ref_flat_name(cp)
+        if module_prefix != "" && const_ref_is_relative(cp) == 1
+          cname = module_prefix + "_" + cname
+        end
+      end
+      ci = find_class_idx(cname)
+      normalize_implicit_new_ivar_inits(@nd_body[nid], ci, module_prefix)
+      return
+    end
+    if t == "SingletonClassNode"
+      return
+    end
+    if t == "InstanceVariableWriteNode" && class_idx >= 0
+      spec_cls = implicit_new_site_class(@nd_expression[nid])
+      if spec_cls != ""
+        rewrite_implicit_new_ivar_init_type(class_idx, @nd_name[nid], spec_cls)
+      end
+    end
+    cs = []
+    push_child_ids(nid, cs)
+    k = 0
+    while k < cs.length
+      normalize_implicit_new_ivar_inits(cs[k], class_idx, module_prefix)
+      k = k + 1
+    end
+  end
+
+  def collect_implicit_new_specializations
+    site_ids = []
+    site_classes = "".split(",", -1)
+    collect_implicit_new_site_candidates(@root_id, site_ids, site_classes)
+    original_class_count = @cls_names.length
+    ci = 0
+    while ci < original_class_count
+      cname = @cls_names[ci]
+      if implicit_specializable_class?(ci) == 1 && count_implicit_new_sites_for_class(site_classes, cname) >= 2
+        k = 0
+        while k < site_ids.length
+          if site_classes[k] == cname
+            spec_name = cname + "__implicit_" + site_ids[k].to_s
+            if find_class_idx(spec_name) < 0
+              clone_class_slot_for_implicit_new(ci, spec_name)
+            end
+            @implicit_new_site_ids.push(site_ids[k])
+            @implicit_new_site_classes.push(spec_name)
+          end
+          k = k + 1
+        end
+      end
+      ci = ci + 1
+    end
+    collect_implicit_new_local_bindings(@root_id)
+    normalize_implicit_new_ivar_inits(@root_id, -1, "")
   end
 
   def collect_scoped_constant(scope_name, nid)
@@ -14672,7 +15001,13 @@ class Compiler
  # `0` arg and collapse it to poly.
         recv_iow_fwd = @nd_receiver[nid]
         recv_is_ivar_or_local = recv_iow_fwd >= 0 && (@nd_type[recv_iow_fwd] == "InstanceVariableReadNode" || @nd_type[recv_iow_fwd] == "LocalVariableReadNode")
-        if rt == "int" && recv_is_ivar_or_local && primitive_method_shared_with_user_class(mname) == 0
+        recv_has_implicit_new_class = 0
+        if recv_iow_fwd >= 0 && @nd_type[recv_iow_fwd] == "LocalVariableReadNode"
+          if implicit_new_local_class(@nd_name[recv_iow_fwd]) != ""
+            recv_has_implicit_new_class = 1
+          end
+        end
+        if rt == "int" && recv_is_ivar_or_local && recv_has_implicit_new_class == 0 && primitive_method_shared_with_user_class(mname) == 0
  # Walk every user class that defines mname AND whose
  # param count matches the call's arg count. Pre-fix
  # this branch bailed on multi-match cases

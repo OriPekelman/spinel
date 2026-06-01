@@ -3252,6 +3252,47 @@ class Compiler
     if pa != ""
       return pa
     end
+ # Shared method bodies can be emitted under several specialized
+ # classes. The IR cache is keyed only by AST node id, so an
+ # InstanceVariableReadNode inside a shared body may carry the last
+ # class's ivar type. Resolve ivars from the active class scope before
+ # honoring the cache.
+    if @nd_type[nid] == "InstanceVariableReadNode" && @current_class_idx >= 0
+      ivt_shared = cls_ivar_type(@current_class_idx, @nd_name[nid])
+      if ivt_shared != ""
+        return ivt_shared
+      end
+    end
+ # Shared method bodies can also carry stale LocalVariableReadNode
+ # cache entries after clone-local declarations are refined for an
+ # implicit allocation-site specialization. Prefer the active C local
+ # scope in those synthetic classes before honoring the shared cache.
+    if @nd_type[nid] == "LocalVariableReadNode" && @current_class_idx >= 0
+      if implicit_specialization_class_name?(@cls_names[@current_class_idx]) == 1
+        lvt_shared = find_var_type(@nd_name[nid])
+        if lvt_shared != ""
+          return lvt_shared
+        end
+      end
+    end
+ # A no-receiver call inside a shared helper body (e.g.
+ # `relationship_exists` calling `find_by_id`) also has a cache entry
+ # keyed only by AST node id. In implicit specializations the callee's
+ # return type is class-specific, so resolve it against the active class
+ # before honoring the shared cache.
+    if @nd_type[nid] == "CallNode" && @current_class_idx >= 0
+      if implicit_specialization_class_name?(@cls_names[@current_class_idx]) == 1 && @nd_receiver[nid] < 0
+        nrecv_m = @nd_name[nid]
+        nrecv_owner = find_method_owner(@current_class_idx, nrecv_m)
+        if nrecv_owner != ""
+          nrecv_ci = find_class_idx(nrecv_owner)
+          nrecv_rt = cls_method_return(nrecv_ci, nrecv_m)
+          if nrecv_rt != ""
+            return nrecv_rt
+          end
+        end
+      end
+    end
  # Sibling-scope narrow override: when the active narrow stack
  # narrows `x` to `obj_<C>` and this CallNode is `x.attr` where
  # `attr` is an attr_reader on `C`, the cached type (filled by
@@ -10547,20 +10588,22 @@ class Compiler
       j = 0
       while j < mnames.length
         if mnames[j] != "initialize"
-          rt = "int"
-          if j < returns.length
-            rt = returns[j]
+          if implicit_specialization_template_class?(i) == 0
+            rt = "int"
+            if j < returns.length
+              rt = returns[j]
+            end
+            yp = ""
+            if cls_method_has_yield(i, j) == 1
+              yp = yield_params_suffix_cls(i, j)
+            end
+            sp = " *self"
+            if @cls_is_value_type[i] == 1
+              sp = " self"
+            end
+            bid_j = j < bids.length ? bids[j].to_i : -1
+            emit_raw(method_linkage_named(bid_j, cls_method_has_yield(i, j), mnames[j]) + c_type(rt) + " sp_" + cname + "_" + sanitize_name(mnames[j]) + "(sp_" + cname + sp + method_with_self_params(i, j) + yp + ");")
           end
-          yp = ""
-          if cls_method_has_yield(i, j) == 1
-            yp = yield_params_suffix_cls(i, j)
-          end
-          sp = " *self"
-          if @cls_is_value_type[i] == 1
-            sp = " self"
-          end
-          bid_j = j < bids.length ? bids[j].to_i : -1
-          emit_raw(method_linkage_named(bid_j, cls_method_has_yield(i, j), mnames[j]) + c_type(rt) + " sp_" + cname + "_" + sanitize_name(mnames[j]) + "(sp_" + cname + sp + method_with_self_params(i, j) + yp + ");")
         end
         j = j + 1
       end
@@ -11353,6 +11396,33 @@ class Compiler
     0
   end
 
+  def implicit_specialization_class_name?(name)
+    if name.index("__implicit_")
+      return 1
+    end
+    0
+  end
+
+  def implicit_specialization_template_class?(ci)
+    if ci < 0 || ci >= @cls_names.length
+      return 0
+    end
+    cname = @cls_names[ci]
+    if implicit_specialization_class_name?(cname) == 1
+      return 0
+    end
+    prefix = cname + "__implicit_"
+    k = 0
+    while k < @cls_names.length
+      other = @cls_names[k]
+      if other.length > prefix.length && other[0, prefix.length] == prefix
+        return 1
+      end
+      k = k + 1
+    end
+    0
+  end
+
   def emit_class_methods
     i = 0
     while i < @cls_names.length
@@ -11369,23 +11439,25 @@ class Compiler
       j = 0
       while j < mnames.length
         if mnames[j] != "initialize"
-          rt = "int"
-          if j < returns.length
-            rt = returns[j]
+          if implicit_specialization_template_class?(i) == 0
+            rt = "int"
+            if j < returns.length
+              rt = returns[j]
+            end
+            bid = -1
+            if j < bodies.length
+              bid = bodies[j].to_i
+            end
+            pnames = "".split(",", -1)
+            ptypes = "".split(",", -1)
+            if j < all_params.length
+              pnames = all_params[j].split(",", -1)
+            end
+            if j < all_ptypes.length
+              ptypes = all_ptypes[j].split(",", -1)
+            end
+            emit_instance_method(i, mnames[j], pnames, ptypes, rt, bid)
           end
-          bid = -1
-          if j < bodies.length
-            bid = bodies[j].to_i
-          end
-          pnames = "".split(",", -1)
-          ptypes = "".split(",", -1)
-          if j < all_params.length
-            pnames = all_params[j].split(",", -1)
-          end
-          if j < all_ptypes.length
-            ptypes = all_ptypes[j].split(",", -1)
-          end
-          emit_instance_method(i, mnames[j], pnames, ptypes, rt, bid)
         end
         j = j + 1
       end
@@ -12170,7 +12242,7 @@ class Compiler
  # subclasses, so the per-bid @nd_scope_names entry was last-
  # class-wins; the per-(ci, cmj) entry is subclass-specific.
       if scope_n != "" || scope_t != ""
-        declare_method_locals_from(scope_n, scope_t, pnames)
+        declare_method_locals_from(scope_n, scope_t, pnames, bid)
       else
         declare_method_locals(bid, pnames)
       end
@@ -12212,13 +12284,14 @@ class Compiler
  # scope tables (in the same "|"-joined format as
  # @nd_scope_names) instead of looking them up by bid. Used by
  # the cmeth emit path to plumb per-(ci, cmj) tables through.
-  def declare_method_locals_from(sn, st, params)
+  def declare_method_locals_from(sn, st, params, bid)
     lnames = "".split(",", -1)
     ltypes = "".split(",", -1)
     if sn != ""
       lnames = sn.split("|", -1)
       ltypes = st.split("|", -1)
     end
+    refine_implicit_specialized_local_types(bid, lnames, ltypes)
     j = 0
     while j < lnames.length
       declare_var(lnames[j], ltypes[j])
@@ -12712,6 +12785,7 @@ class Compiler
       lnames = sn.split("|", -1)
       ltypes = st.split("|", -1)
     end
+    refine_implicit_specialized_local_types(bid, lnames, ltypes)
     j = 0
     while j < lnames.length
       declare_var(lnames[j], ltypes[j])
@@ -12853,6 +12927,86 @@ class Compiler
       pt = find_var_declared_type(params[j])
       if gc_trace_kind(pt) != "none"
         emit_gc_root_for_expr("lv_" + params[j], pt)
+      end
+      j = j + 1
+    end
+  end
+
+  def implicit_specialized_local_write_type(nid, lname)
+    if nid < 0
+      return ""
+    end
+    t = @nd_type[nid]
+    if t == "DefNode" || t == "ClassNode" || t == "ModuleNode" || t == "SingletonClassNode"
+      return ""
+    end
+    result = ""
+    if t == "LocalVariableWriteNode" && @nd_name[nid] == lname
+      rhs_t = implicit_specialized_expr_type(@nd_expression[nid])
+      if rhs_t == ""
+        rhs_t = infer_type(@nd_expression[nid])
+      end
+      if rhs_t != "" && rhs_t != "int"
+        result = rhs_t
+      end
+    end
+    cs = []
+    push_child_ids(nid, cs)
+    k = 0
+    while k < cs.length
+      ct = implicit_specialized_local_write_type(cs[k], lname)
+      if ct != ""
+        if result == ""
+          result = ct
+        elsif result != ct
+          return ""
+        end
+      end
+      k = k + 1
+    end
+    result
+  end
+
+  def implicit_specialized_expr_type(nid)
+    if nid < 0 || @current_class_idx < 0
+      return ""
+    end
+    if implicit_specialization_class_name?(@cls_names[@current_class_idx]) == 0
+      return ""
+    end
+    if @nd_type[nid] == "CallNode" && @nd_name[nid] == "[]"
+      recv = @nd_receiver[nid]
+      if recv >= 0 && @nd_type[recv] == "InstanceVariableReadNode"
+        rt = cls_ivar_type(@current_class_idx, @nd_name[recv])
+        if is_array_type(rt) == 1
+          return elem_type_of_array(rt)
+        end
+      end
+    end
+    ""
+  end
+
+  def refine_implicit_specialized_local_types(bid, lnames, ltypes)
+    if bid < 0 || @current_class_idx < 0
+      return
+    end
+    if implicit_specialization_class_name?(@cls_names[@current_class_idx]) == 0
+      return
+    end
+    j = 0
+    while j < lnames.length
+      rt = implicit_specialized_local_write_type(bid, lnames[j])
+      if rt != ""
+        if j >= ltypes.length
+          while ltypes.length <= j
+            ltypes.push("int")
+          end
+        end
+        if ltypes[j] != rt
+          if is_obj_type(base_type(rt)) == 1 || is_array_type(rt) == 1 || rt == "string" || rt == "mutable_str" || rt == "poly"
+            ltypes[j] = rt
+          end
+        end
       end
       j = j + 1
     end
@@ -20746,6 +20900,13 @@ class Compiler
 
   def compile_constructor_expr(nid, recv)
     cname = constructor_class_name(recv)
+    cached_ctor_t = @nd_inferred_type[nid]
+    if cached_ctor_t != "" && is_obj_type(cached_ctor_t) == 1
+      cached_ctor_cname = cached_ctor_t[4, cached_ctor_t.length - 4]
+      if find_class_idx(cached_ctor_cname) >= 0
+        cname = cached_ctor_cname
+      end
+    end
     if cname == ""
       cname = implicit_new_class_name(recv)
     end
@@ -37805,6 +37966,17 @@ class Compiler
           return
         end
         rt = infer_type(arg_ids[0])
+        if @current_class_idx >= 0 && @nd_type[arg_ids[0]] == "LocalVariableReadNode"
+          if implicit_specialization_class_name?(@cls_names[@current_class_idx]) == 1
+            declared_rt = find_var_declared_type(@nd_name[arg_ids[0]])
+            if declared_rt != ""
+              rt = declared_rt
+            end
+            if @current_method_return != "" && @current_method_return != "void" && @current_method_return != "poly"
+              rt = @current_method_return
+            end
+          end
+        end
  # return nil in a nullable pointer method → return NULL
         if rt == "nil" && is_nullable_pointer_type(@current_method_return) == 1
           emit_setjmp_depth_unwind
