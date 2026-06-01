@@ -168,7 +168,7 @@ NODE_TABLE_LOADER_STAMP := build/stamps/node_table_loader.rb.stamp
 COMPILER_HELPERS_STAMP := build/stamps/compiler_helpers.rb.stamp
 PARSE_STAMP   := build/stamps/spinel_parse.c.stamp
 
-.PHONY: all parse bootstrap bootstrap-fixpoint fast-bootstrap codegen rbs_extract rbs-test analyze-fail-test regen-rbs-expected test retest fast-test clean-test-results regen-expected bench optcarrot gate check gate-legs gate-test gate-bench gate-optcarrot clean install uninstall deps FORCE
+.PHONY: all parse bootstrap bootstrap-fixpoint fast-bootstrap codegen rbs_extract rbs-test analyze-fail-test regen-rbs-expected test retest fast-test triage clean-test-results regen-expected bench optcarrot gate check gate-legs gate-test gate-bench gate-optcarrot clean install uninstall deps FORCE
 
 # `make all` includes spinel_rbs_extract when vendor/rbs has been
 # fetched (via `make deps`). Without vendor/rbs the extractor is
@@ -604,6 +604,19 @@ analyze-fail-test: spinel_parse$(EXE) spinel_analyze$(EXE)
 	done; \
 	echo "Analyze-fail tests: $$n pass"; \
 	if [ $$fail -ne 0 ]; then exit 1; fi
+
+# Localize test failures: run the value-bisection harness (in the spinel-dev
+# sibling) over every FAIL/ERR in build/test-results, turning "output differs"
+# into a variable+line / crash site. Run `make test` first. Override the path
+# with BISECT_DIR if spinel-dev lives elsewhere.
+BISECT_DIR ?= ../spinel-dev/tools/value-bisect
+triage:
+	@if [ -x "$(BISECT_DIR)/triage.sh" ]; then \
+	  SPINEL_DIR="$(CURDIR)" "$(BISECT_DIR)/triage.sh" --failing; \
+	else \
+	  echo "triage: harness not found at $(BISECT_DIR) (set BISECT_DIR=/path/to/spinel-dev/tools/value-bisect)"; \
+	  exit 1; \
+	fi
 
 # The .ok target is the test's stamp; mtime tracking gives per-test
 # caching for free. Order-only spinel_parse$(EXE) / spinel_analyze$(EXE)
