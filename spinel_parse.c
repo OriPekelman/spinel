@@ -348,6 +348,50 @@ static int flatten(pm_node_t *node) {
     R("target", n->target);
     break;
   }
+  case PM_CONSTANT_OPERATOR_WRITE_NODE: {
+    pm_constant_operator_write_node_t *n = (pm_constant_operator_write_node_t *)node;
+    N("ConstantOperatorWriteNode");
+    NAME("name", n->name);
+    NAME("binary_operator", n->binary_operator);
+    R("value", n->value);
+    break;
+  }
+  case PM_CONSTANT_OR_WRITE_NODE: {
+    pm_constant_or_write_node_t *n = (pm_constant_or_write_node_t *)node;
+    N("ConstantOrWriteNode");
+    NAME("name", n->name);
+    R("value", n->value);
+    break;
+  }
+  case PM_CONSTANT_AND_WRITE_NODE: {
+    pm_constant_and_write_node_t *n = (pm_constant_and_write_node_t *)node;
+    N("ConstantAndWriteNode");
+    NAME("name", n->name);
+    R("value", n->value);
+    break;
+  }
+  case PM_CONSTANT_PATH_OPERATOR_WRITE_NODE: {
+    pm_constant_path_operator_write_node_t *n = (pm_constant_path_operator_write_node_t *)node;
+    N("ConstantPathOperatorWriteNode");
+    NAME("binary_operator", n->binary_operator);
+    R("value", n->value);
+    R("target", (pm_node_t *)n->target);
+    break;
+  }
+  case PM_CONSTANT_PATH_OR_WRITE_NODE: {
+    pm_constant_path_or_write_node_t *n = (pm_constant_path_or_write_node_t *)node;
+    N("ConstantPathOrWriteNode");
+    R("value", n->value);
+    R("target", (pm_node_t *)n->target);
+    break;
+  }
+  case PM_CONSTANT_PATH_AND_WRITE_NODE: {
+    pm_constant_path_and_write_node_t *n = (pm_constant_path_and_write_node_t *)node;
+    N("ConstantPathAndWriteNode");
+    R("value", n->value);
+    R("target", (pm_node_t *)n->target);
+    break;
+  }
   case PM_CONSTANT_READ_NODE: {
     pm_constant_read_node_t *n = (pm_constant_read_node_t *)node;
     N("ConstantReadNode");

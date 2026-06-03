@@ -367,6 +367,9 @@ class Compiler
  # leaves the cvar at its type-default until first write.
     @cvar_init_values = "".split(",", -1)
     @const_expr_ids = []
+ # Parallel to @const_names: 1 when the const is compound-assigned, so
+ # its reads load the live slot instead of folding the literal.
+    @const_mutated = []
     @const_scope_names = "".split(",", -1)
  # See spinel_analyze.rb's @const_init_class for the schema.
  # Issue #646.
@@ -2756,6 +2759,11 @@ class Compiler
  # OK = true → TRUE
   def const_literal_c_value(ci)
     if ci < 0 || ci >= @const_expr_ids.length
+      return ""
+    end
+ # A compound-assigned constant is mutated at runtime; never fold its
+ # reads to the declaration literal -- they must load the live slot.
+    if ci < @const_mutated.length && @const_mutated[ci] == 1
       return ""
     end
     eid = @const_expr_ids[ci]
@@ -14563,6 +14571,17 @@ class Compiler
       compile_stmt(nid)
       qname_e = cvar_qname(@current_class_idx, @nd_name[nid])
       return "cvar_" + qname_e
+    end
+    if t == "ConstantOperatorWriteNode" || t == "ConstantOrWriteNode" || t == "ConstantAndWriteNode" || t == "ConstantPathOperatorWriteNode" || t == "ConstantPathOrWriteNode" || t == "ConstantPathAndWriteNode"
+ # Expression form (`x = (A += 2)` or last stmt of a body). Run the
+ # statement-style emit for the side effect, then surface the
+ # constant's post-assign slot value.
+      compile_stmt(nid)
+      cn_cw = t.start_with?("ConstantPath") ? resolve_const_ref_name(@nd_target[nid]) : resolve_const_read_name(@nd_name[nid])
+      if cn_cw != "" && find_const_idx(cn_cw) >= 0
+        return "cst_" + cn_cw
+      end
+      return "0"
     end
     if t == "InstanceVariableWriteNode"
  # Same poly-slot boxing as the statement-form emit.
@@ -35176,6 +35195,60 @@ class Compiler
     tmp
   end
 
+ # Compound assignment to a constant or constant-path target
+ # (`A += 2`, `A ||= 2`, `A::B &&= 2`, ...). Constants are stored in
+ # write-once `cst_<name>` C globals, but the slot itself is a mutable
+ # global, so a compound form lowers to a runtime read-modify-write on
+ # that slot -- mirroring the global/class-variable op-write paths.
+ # An undefined constant (no `cst_` slot) is left unemitted: CRuby
+ # raises NameError, and a later read of the still-undefined constant
+ # raises at runtime, rather than the compiler hard-failing.
+  def emit_constant_compound_write(nid)
+    t = @nd_type[nid]
+    is_path = t.start_with?("ConstantPath")
+    if is_path
+      cname = resolve_const_ref_name(@nd_target[nid])
+    else
+      cname = resolve_const_read_name(@nd_name[nid])
+    end
+    if cname == ""
+      return
+    end
+    ci = find_const_idx(cname)
+    if ci < 0
+      return
+    end
+    ctype = @const_types[ci]
+    slot = "cst_" + cname
+    if t == "ConstantOperatorWriteNode" || t == "ConstantPathOperatorWriteNode"
+      op = @nd_binop[nid]
+      val = compile_expr(@nd_expression[nid])
+      if op == "/"
+        emit("  " + slot + " = sp_idiv(" + slot + ", " + val + ");")
+      elsif op == "%"
+        emit("  " + slot + " = sp_imod(" + slot + ", " + val + ");")
+      elsif op == "+" || op == "-" || op == "*" || op == "<<" || op == ">>" || op == "&" || op == "|" || op == "^"
+        emit("  " + slot + " " + op + "= " + val + ";")
+      else
+        emit("  " + slot + " = " + slot + " " + op + " " + val + ";")
+      end
+      return
+    end
+ # `||=` / `&&=`: evaluate and store the rhs only on the falsy /
+ # truthy branch. truthy_c_expr keeps Ruby truthiness, so a typed-int
+ # constant (always truthy in Ruby, e.g. `A = 0; A ||= 2` stays 0) is
+ # handled correctly rather than via raw C `if (!slot)`.
+    cond = truthy_c_expr(ctype, slot)
+    if t == "ConstantOrWriteNode" || t == "ConstantPathOrWriteNode"
+      emit("  if (!(" + cond + ")) {")
+    else
+      emit("  if (" + cond + ") {")
+    end
+    val = compile_expr_for_expected_type(@nd_expression[nid], ctype)
+    emit("    " + slot + " = " + val + ";")
+    emit("  }")
+  end
+
  # ---- Statement compiler ----
   def compile_stmt(nid)
     if nid < 0
@@ -35265,6 +35338,10 @@ class Compiler
       val = compile_expr(@nd_expression[nid])
       emit("    " + cname + " = " + val + ";")
       emit("  }")
+      return
+    end
+    if t == "ConstantOperatorWriteNode" || t == "ConstantOrWriteNode" || t == "ConstantAndWriteNode" || t == "ConstantPathOperatorWriteNode" || t == "ConstantPathOrWriteNode" || t == "ConstantPathAndWriteNode"
+      emit_constant_compound_write(nid)
       return
     end
     if t == "ClassVariableWriteNode"
@@ -50971,6 +51048,8 @@ class Compiler
       @cls_is_sra = val
     elsif name == "@const_expr_ids"
       @const_expr_ids = val
+    elsif name == "@const_mutated"
+      @const_mutated = val
     elsif name == "@module_body_ids"
       @module_body_ids = val
     elsif name == "@ffi_buf_sizes"

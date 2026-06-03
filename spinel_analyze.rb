@@ -366,6 +366,10 @@ class Compiler
  # leaves the cvar at its type-default until first write.
     @cvar_init_values = "".split(",", -1)
     @const_expr_ids = []
+ # Parallel to @const_names: 1 when const `<X>` is compound-assigned
+ # (`X += 2`, `X ||= 2`, ...) somewhere, so its read sites must load the
+ # live `cst_<X>` slot instead of folding to the declaration literal.
+    @const_mutated = []
     @const_scope_names = "".split(",", -1)
  # Parallel to @const_names: when const `<X>`'s init RHS is the
  # canonical `<Class>.new(...)` shape, record `<Class>` here so
@@ -2615,6 +2619,25 @@ class Compiler
           if nn_file == "SEPARATOR" || nn_file == "ALT_SEPARATOR" || nn_file == "PATH_SEPARATOR"
             return "string"
           end
+        end
+      end
+      return "int"
+    end
+ # Compound assignment to a constant used in value position
+ # (`x = (A += 2)`); the result type is the constant's own type.
+    if t == "ConstantOperatorWriteNode" || t == "ConstantOrWriteNode" || t == "ConstantAndWriteNode"
+      ci_cw = find_const_idx(resolve_const_read_name(@nd_name[nid]))
+      if ci_cw >= 0
+        return @const_types[ci_cw]
+      end
+      return "int"
+    end
+    if t == "ConstantPathOperatorWriteNode" || t == "ConstantPathOrWriteNode" || t == "ConstantPathAndWriteNode"
+      cpn_cw = resolve_const_ref_name(@nd_target[nid])
+      if cpn_cw != ""
+        ci_cw2 = find_const_idx(cpn_cw)
+        if ci_cw2 >= 0
+          return @const_types[ci_cw2]
         end
       end
       return "int"
@@ -8611,6 +8634,20 @@ class Compiler
       end
     }
 
+ # Pass 2.1: constants that are compound-assigned anywhere lose their
+ # foldable literal so reads load the live slot (runs after all const
+ # registration so the targets resolve). @const_mutated is sized to
+ # match @const_names here, after every constant is registered.
+    @const_mutated = []
+    cmi = 0
+    while cmi < @const_names.length
+      @const_mutated.push(0)
+      cmi = cmi + 1
+    end
+    stmts.each { |sid|
+      scan_mutated_constants(sid, "")
+    }
+
  # Top-level `alias $copy $orig` and BEGIN. Aliases are
  # recorded into @galias_* (consulted by sanitize_gvar /
  # scan_features / infer_type so $copy and $orig share
@@ -14263,6 +14300,49 @@ class Compiler
       @multi_const_inits = "".split(",", -1)
     end
     @multi_const_inits.push(scope_name + "|" + nid.to_s)
+  end
+
+ # A constant that is compound-assigned (`A += 2`, `A ||= 2`, ...) is
+ # mutated at runtime, so its value can no longer be folded to the
+ # declaration literal at read sites -- readers must load the live
+ # `cst_<name>` slot. Walk the tree and clear the foldable expr id for
+ # every plain-constant compound-write target, mirroring how a constant
+ # multi-assign target marks @const_expr_ids = -1. Constant-path targets
+ # are never folded, so they need no marking here.
+  def scan_mutated_constants(nid, scope)
+    if nid < 0
+      return
+    end
+    t = @nd_type[nid]
+    if t == "ConstantOperatorWriteNode" || t == "ConstantOrWriteNode" || t == "ConstantAndWriteNode"
+      ci = -1
+      if scope != ""
+        ci = find_const_idx(scope + "_" + @nd_name[nid])
+      end
+      if ci < 0
+        ci = find_const_idx(@nd_name[nid])
+      end
+      if ci >= 0 && ci < @const_mutated.length
+        @const_mutated[ci] = 1
+      end
+    end
+    new_scope = scope
+    if t == "ModuleNode" || t == "ClassNode"
+      cp = @nd_constant_path[nid]
+      if cp >= 0
+        nm = const_ref_flat_name(cp)
+        if nm != ""
+          new_scope = nm
+        end
+      end
+    end
+    cs = []
+    push_child_ids(nid, cs)
+    k = 0
+    while k < cs.length
+      scan_mutated_constants(cs[k], new_scope)
+      k = k + 1
+    end
   end
 
  # Synthetic built-in user class for `method(:foo)` capture: every
@@ -32559,6 +32639,7 @@ class Compiler
     buf = ir_emit_sa(buf, "@const_names", @const_names)
     buf = ir_emit_sa(buf, "@const_types", @const_types)
     buf = ir_emit_ia(buf, "@const_expr_ids", @const_expr_ids)
+    buf = ir_emit_ia(buf, "@const_mutated", @const_mutated)
     buf = ir_emit_sa(buf, "@const_scope_names", @const_scope_names)
     buf = ir_emit_sa(buf, "@const_init_class", @const_init_class)
     buf = ir_emit_sa(buf, "@cvar_names", @cvar_names)
