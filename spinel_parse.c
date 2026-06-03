@@ -1677,6 +1677,33 @@ static char *resolve_plain_requires(char *source, const char *exe_path) {
       }
     }
 
+    /* A trailing same-line modifier (`rescue`, `if`, `unless`, `and`,
+       `&&`, ...) puts the require in expression position: `require 'x'
+       rescue nil`. Replacing it with inlined statements or a comment
+       strands the modifier and Prism reports `unexpected 'rescue'`.
+       Substitute a `nil` expression instead so the modifier attaches;
+       an optional/unavailable require degrades to nil, which is what the
+       `rescue` guards for. `;`, `#`, newline and EOF are statement
+       boundaries, not modifiers, and keep the normal inlining path. */
+    {
+      char *trail = end + 1;
+      while (*trail == ' ' || *trail == '\t') trail++;
+      if (*trail != '\n' && *trail != ';' && *trail != '\0' && *trail != '#') {
+        free(content);
+        size_t rl_len = (size_t)((end + 1) - pos);   /* the `require 'x'` span */
+        size_t result_len = strlen(result);
+        size_t before_len = (size_t)(pos - result);
+        char *new_result = malloc(result_len - rl_len + 4);
+        memcpy(new_result, result, before_len);
+        memcpy(new_result + before_len, "nil", 3);
+        memcpy(new_result + before_len + 3, pos + rl_len,
+               result_len - before_len - rl_len + 1);
+        free(result);
+        result = new_result;
+        continue;
+      }
+    }
+
     /* Replace only the `require "name"` statement itself, not the whole
        line, so `require "x"; code` keeps `code`. Consume trailing
        horizontal whitespace and a single terminating newline (so a
