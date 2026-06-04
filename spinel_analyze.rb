@@ -3392,6 +3392,25 @@ class Compiler
     mname = @nd_name[nid]
     recv = @nd_receiver[nid]
 
+ # Ractor message ops (RFC). Resolved early so the ractor-typed
+ # receiver's `take`/`send` aren't shadowed by Array#take / the
+ # reflective Object#send in infer_recv_method_type below.
+    if mname == "receive" || mname == "recv"
+      if recv >= 0 && constructor_class_name(recv) == "Ractor"
+        return "poly"
+      end
+    end
+    if mname == "take" && recv >= 0
+      if base_type(infer_type(recv)) == "ractor"
+        return "poly"
+      end
+    end
+    if (mname == "send" || mname == "<<") && recv >= 0
+      if base_type(infer_type(recv)) == "ractor"
+        return "ractor"
+      end
+    end
+
  # Lazy range chain `(a..b).lazy[.select/.reject/.filter{blk}].first`.
  # first(n) materialises an int_array, bare first an int. codegen
  # lowers the whole chain to a bounded pull-loop; here we only need
@@ -3908,6 +3927,9 @@ class Compiler
         if rcname == "Fiber"
           return "fiber"
         end
+        if rcname == "Ractor"
+          return "ractor"
+        end
  # Built-in exception class .new (RuntimeError, StandardError,
  # ArgumentError, etc.) and user subclasses of built-in exception
  # classes both lower to a first-class sp_Exception *.
@@ -3925,11 +3947,14 @@ class Compiler
         end
       end
     end
- # Fiber.yield returns poly
+ # Fiber.yield / Ractor.yield return poly
     if mname == "yield"
       if recv >= 0
         rcname = constructor_class_name(recv)
         if rcname == "Fiber"
+          return "poly"
+        end
+        if rcname == "Ractor"
           return "poly"
         end
       end
@@ -7097,6 +7122,9 @@ class Compiler
           if rn == "Fiber"
             return "fiber"
           end
+          if rn == "Ractor"
+            return "ractor"
+          end
  # Time.new(...) is the value-typed sp_Time, not an obj_ heap
  # instance. Without this, `.new` falls to "obj_Time" and every
  # Time local widens to a pointer, breaking the value-type
@@ -8164,6 +8192,9 @@ class Compiler
     if t == "fiber" || t == "bigint"
       return 1
     end
+    if t == "ractor"
+      return 1
+    end
     if t == "proc"
       return 1
     end
@@ -8313,6 +8344,9 @@ class Compiler
       return 1
     end
     if bt == "fiber" || bt == "bigint"
+      return 1
+    end
+    if bt == "ractor"
       return 1
     end
     if bt == "exception"

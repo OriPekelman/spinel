@@ -624,6 +624,7 @@ class Compiler
     @needs_fiber = 0
     @needs_bigint = 0
     @fiber_counter = 0
+    @ractor_counter = 0
     @fiber_funcs = ""
     @in_fiber_body = 0
     @fiber_captures = "".split(",", -1)
@@ -3821,6 +3822,26 @@ class Compiler
       if @nd_receiver[nid] < 0 && (@nd_name[nid] == "proc" || @nd_name[nid] == "lambda")
         return "proc"
       end
+ # Ractor message ops on the cache-miss (block-body) path. Mirrors
+ # analyze's early arms so a ractor op nested in another block types
+ # consistently (RFC).
+      mn_ract = @nd_name[nid]
+      recv_ract = @nd_receiver[nid]
+      if (mn_ract == "receive" || mn_ract == "recv") && recv_ract >= 0 && constructor_class_name(recv_ract) == "Ractor"
+        return "poly"
+      end
+      if mn_ract == "take" && recv_ract >= 0 && base_type(infer_type(recv_ract)) == "ractor"
+        return "poly"
+      end
+      if (mn_ract == "send" || mn_ract == "<<") && recv_ract >= 0 && base_type(infer_type(recv_ract)) == "ractor"
+        return "ractor"
+      end
+      if mn_ract == "yield" && recv_ract >= 0 && constructor_class_name(recv_ract) == "Ractor"
+        return "poly"
+      end
+      if mn_ract == "new" && recv_ract >= 0 && constructor_class_name(recv_ract) == "Ractor"
+        return "ractor"
+      end
  # Bare class-method call inside a class-method body (`def
  # self.last; all[-1]; end` — both `all` and `last` are cmeths
  # on the same class hierarchy). analyze skips the cache for
@@ -4843,6 +4864,9 @@ class Compiler
     if t == "fiber" || t == "bigint"
       return 1
     end
+    if t == "ractor"
+      return 1
+    end
     if t == "proc"
       return 1
     end
@@ -5082,6 +5106,9 @@ class Compiler
     if bt == "fiber" || bt == "bigint" || bt == "exception"
       return 1
     end
+    if bt == "ractor"
+      return 1
+    end
     if is_obj_type(bt) == 1
       return 1
     end
@@ -5255,6 +5282,9 @@ class Compiler
     end
     if t == "fiber"
       return "sp_Fiber *"
+    end
+    if t == "ractor"
+      return "sp_Ractor *"
     end
     if t == "poly"
       return "sp_RbVal"
@@ -16559,6 +16589,9 @@ class Compiler
     if t == "stringio" || t == "fiber" || t == "bigint" || t == "lambda" || t == "poly_array"
       return 1
     end
+    if t == "ractor"
+      return 1
+    end
     0
   end
 
@@ -17543,6 +17576,159 @@ class Compiler
     tmp_fb
   end
 
+ # Collect the names of local variables ASSIGNED anywhere in a Ractor
+ # block body (stopping at nested closures, which manage their own
+ # scope). Used to tell block-locals apart from captured outer reads.
+  def ractor_collect_writes(nid, writes)
+    if nid < 0
+      return
+    end
+    t = @nd_type[nid]
+    if t == "LocalVariableWriteNode" || t == "LocalVariableOperatorWriteNode" || t == "LocalVariableOrWriteNode" || t == "LocalVariableAndWriteNode" || t == "LocalVariableTargetNode"
+      vn = @nd_name[nid]
+      if not_in(vn, writes) == 1
+        writes.push(vn)
+      end
+    end
+    if t == "LambdaNode"
+      return
+    end
+ # `[]` (int_array): push_child_ids' accumulator carries node ids, and
+ # its param type is shared across every caller — a string-array here
+ # would widen that param and miscompile the other walkers.
+    cs = []
+    push_child_ids(nid, cs)
+    k = 0
+    while k < cs.length
+      ractor_collect_writes(cs[k], writes)
+      k = k + 1
+    end
+  end
+
+ # Ractor.new { ... } (RFC, Milestone 1). Clone of compile_fiber_new's
+ # shape: the block body becomes a file-scope `_ractor_body_N` function
+ # run on a pthread by sp_ractor_new. Captures are rejected here (the
+ # isolation rule): only message passing may cross a Ractor boundary, so
+ # any captured outer variable or `self` is a compile-time
+ # Ractor::IsolationError. Block (spawn) parameters are likewise not
+ # supported in this milestone.
+  def compile_ractor_new(nid)
+    blk = @nd_block[nid]
+    if blk < 0
+      return "NULL"
+    end
+    body = @nd_body[blk]
+
+ # Reject block parameters (spawn-arg passing is a later milestone).
+    bparams = @nd_parameters[blk]
+    if bparams >= 0
+      inner = @nd_parameters[bparams]
+      if inner >= 0
+        reqs = parse_id_list(@nd_requireds[inner])
+        if reqs.length > 0
+          raise "Ractor::IsolationError: Ractor.new block parameters (spawn args) are not supported in this build"
+        end
+      end
+    end
+
+ # Isolation rule: detect captured outer variables and reject them.
+ # Reuse the Fiber free-var machinery (scope names that resolve to an
+ # outer-scope type are captures; scan_fiber_free_vars adds read-only
+ # captures the scope table misses).
+    all_names = "".split(",", -1)
+    if body >= 0
+      sn_b = @nd_scope_names[body]
+      if sn_b != ""
+        all_names = sn_b.split("|", -1)
+      end
+    end
+    free_vars = "".split(",", -1)
+    free_var_types = "".split(",", -1)
+    local_names = "".split(",", -1)
+    local_types = "".split(",", -1)
+    all_types = "".split(",", -1)
+    if body >= 0
+      st_b = @nd_scope_types[body]
+      if st_b != ""
+        all_types = st_b.split("|", -1)
+      end
+    end
+ # Variables assigned somewhere in the block are block-locals, even
+ # though spinel hoists them into the enclosing scope (so find_var_type
+ # would otherwise mis-read them as captures, the way Fiber.new captures
+ # them by cell). A name that is only READ and resolves in an outer scope
+ # is a genuine capture and violates Ractor isolation.
+    writes = "".split(",", -1)
+    if body >= 0
+      ractor_collect_writes(body, writes)
+    end
+    k = 0
+    while k < all_names.length
+      nm = all_names[k]
+      ty = "poly"
+      if k < all_types.length
+        ty = all_types[k]
+      end
+      if not_in(nm, writes) == 1 && find_var_type(nm) != ""
+        free_vars.push(nm)
+        free_var_types.push(ty)
+      else
+        local_names.push(nm)
+        local_types.push(ty)
+      end
+      k = k + 1
+    end
+ # Also catch outer reads that never entered the block's scope table.
+    if body >= 0
+      scan_fiber_free_vars(body, writes, all_names, free_vars, free_var_types)
+    end
+    if free_vars.length > 0
+      raise "Ractor::IsolationError: Ractor.new block captures outer variable `" + free_vars[0] + "` (only message passing may cross a Ractor boundary; shareable-by-value capture is a later milestone)"
+    end
+    if body >= 0 && fiber_body_uses_self(body) == 1
+      raise "Ractor::IsolationError: Ractor.new block references self (a Ractor cannot capture its enclosing instance)"
+    end
+
+    fid = @ractor_counter
+    @ractor_counter = @ractor_counter + 1
+    fname = "_ractor_body_" + fid.to_s
+
+ # Compile the body into a void function (no yielded-value capture: the
+ # block's return value is not delivered to take in this milestone; only
+ # explicit Ractor.yield is).
+    saved_out = @out_lines
+    saved_indent = @indent
+    @out_lines = "".split(",", -1)
+    @indent = 1
+    push_scope
+    if body >= 0
+      lk = 0
+      while lk < local_names.length
+        declare_var(local_names[lk], local_types[lk])
+        emit("  " + c_type(local_types[lk]) + " lv_" + local_names[lk] + " = " + c_default_val(local_types[lk]) + ";")
+        lk = lk + 1
+      end
+      stmts = get_stmts(body)
+      i = 0
+      while i < stmts.length
+        compile_stmt(stmts[i])
+        i = i + 1
+      end
+    end
+    pop_scope
+
+    rbody = "static void " + fname + "(sp_RactorCtrl *_rc) {" + 10.chr
+    rbody = rbody + "  (void)_rc;" + 10.chr
+    rbody = rbody + @out_lines.join(10.chr) + 10.chr
+    rbody = rbody + "}" + 10.chr
+    @fiber_funcs << rbody
+
+    @out_lines = saved_out
+    @indent = saved_indent
+
+    "sp_ractor_new(" + fname + ")"
+  end
+
  # Returns the C expression for a CallNode. Symmetric with
  # `infer_call_type` (which returns the call's C type) — see the
  # docstring there for the maintenance rule on adding new shapes.
@@ -17632,6 +17818,23 @@ class Compiler
  # explicit Signal / ::Signal receivers via trap_call_is_signal_stub.
     if mname == "trap" && trap_call_is_signal_stub(nid) == 1
       return "SPL(\"DEFAULT\")"
+    end
+
+ # r.send(v) / r << v : Ractor mailbox push. Must precede the reflective
+ # Object#send arm below, and is gated on the receiver's static type so a
+ # plain `obj.send(:meth)` is unaffected. Returns the Ractor itself.
+    if (mname == "send" || mname == "<<") && recv >= 0
+      if base_type(infer_type(recv)) == "ractor"
+        rc = compile_expr_gc_rooted(recv)
+        args_id = @nd_arguments[nid]
+        if args_id >= 0
+          arg_ids = get_args(args_id)
+          if arg_ids.length > 0
+            return "sp_ractor_send((sp_Ractor *)(" + rc + "), " + box_expr_to_poly(arg_ids[0]) + ")"
+          end
+        end
+        return "sp_ractor_send((sp_Ractor *)(" + rc + "), sp_box_nil())"
+      end
     end
 
  # `recv.send(:method_name, args...)` with a SymbolNode method
@@ -17913,6 +18116,22 @@ class Compiler
       if constructor_class_name(recv) == "Fiber"
         return compile_fiber_new(nid)
       end
+      if constructor_class_name(recv) == "Ractor"
+        return compile_ractor_new(nid)
+      end
+    end
+ # Ractor.receive / Ractor.recv : pop from the running Ractor's inbox.
+    if mname == "receive" || mname == "recv"
+      if recv >= 0 && constructor_class_name(recv) == "Ractor"
+        return "sp_ractor_receive()"
+      end
+    end
+ # r.take : pop from the child Ractor's outbox (re-raises on child fail).
+    if mname == "take" && recv >= 0
+      if base_type(infer_type(recv)) == "ractor"
+        rc = compile_expr_gc_rooted(recv)
+        return "sp_ractor_take((sp_Ractor *)(" + rc + "))"
+      end
     end
  # fiber.resume(val)
     if mname == "resume" && recv >= 0
@@ -17929,7 +18148,7 @@ class Compiler
         return "sp_Fiber_resume((sp_Fiber *)(" + rc + "), sp_box_nil())"
       end
     end
- # Fiber.yield(val)
+ # Fiber.yield(val) / Ractor.yield(val) — disambiguated by receiver name.
     if mname == "yield" && recv >= 0
       if constructor_class_name(recv) == "Fiber"
         @needs_fiber = 1
@@ -17941,6 +18160,16 @@ class Compiler
           end
         end
         return "sp_Fiber_yield(sp_box_nil())"
+      end
+      if constructor_class_name(recv) == "Ractor"
+        args_id = @nd_arguments[nid]
+        if args_id >= 0
+          arg_ids = get_args(args_id)
+          if arg_ids.length > 0
+            return "sp_ractor_yield(" + box_expr_to_poly(arg_ids[0]) + ")"
+          end
+        end
+        return "sp_ractor_yield(sp_box_nil())"
       end
     end
  # fiber.alive?

@@ -341,7 +341,11 @@ static const char *sp_rational_inspect(sp_Rational r) {
    recycle(h) on the unmarked object instead of finalize+free. The
    hook is responsible for deciding whether to keep the storage
    (pool push) or free it. Used by class-instance free-list pools. */
-static sp_gc_hdr *sp_gc_heap = NULL; static size_t sp_gc_bytes = 0; static size_t sp_gc_threshold = 256*1024;
+/* Ractor isolation (RFC): the GC heap and its bookkeeping are per-Ractor.
+   Each pthread-backed Ractor gets its own private heap, so collection is
+   thread-local and needs no global GC lock. For a single-threaded program
+   this is exactly the old single static heap, just in TLS. */
+static __thread sp_gc_hdr *sp_gc_heap = NULL; static __thread size_t sp_gc_bytes = 0; static __thread size_t sp_gc_threshold = 256*1024;
 
 /* ---- GC verify: opt-in mark-path validation (release-neutral) ------------
  * SPINEL_GC_VERIFY=1  before the collector invokes an object's scan hook,
@@ -357,7 +361,7 @@ static int  sp_gc_obj_registered(sp_gc_hdr *h);
 static void sp_gc_verify_fail(void *obj, sp_gc_hdr *h);
 
 /* ---- String GC ---- */
-static sp_str_hdr *sp_str_heap = NULL;
+static __thread sp_str_hdr *sp_str_heap = NULL;
 #define SPL(s) (&("\xff" s)[1])
 static const char sp_str_empty_data[] = "\xff";
 #define sp_str_empty (sp_str_empty_data + 1)
@@ -496,7 +500,7 @@ static const char *sp_int_codepoint_to_str(mrb_int n) {
    0xfd) whose buffers can move on realloc. */
 #define SP_STR_LCACHE_BITS 5
 #define SP_STR_LCACHE_SIZE (1u << SP_STR_LCACHE_BITS)
-static struct sp_str_lcache_entry {
+static __thread struct sp_str_lcache_entry {
   const char *s;
   size_t byte_len;
   mrb_int char_len;
@@ -699,7 +703,13 @@ static const char *sp_time_inspect_v(sp_Time t) {
 }
 
 #define SP_GC_STACK_MAX 65536
-static void **sp_gc_roots[SP_GC_STACK_MAX]; static int sp_gc_nroots = 0;
+/* Ractor isolation (RFC): the root window is per-thread. As a flat
+   __thread array this would commit 512 KiB of TLS (.tbss) per Ractor, so
+   it is a lazily-malloc'd __thread pointer instead — allocated on the
+   first root push (see _sp_gc_root_push). Array-index syntax through the
+   pointer is identical, so SP_GC_ROOT / SP_GC_SAVE and the fiber
+   save/restore paths are unchanged. */
+static __thread void ***sp_gc_roots = NULL; static __thread int sp_gc_nroots = 0;
 /* Cooperative-fiber GC root storage (issue #636).
    sp_gc_roots[] holds the CURRENT fiber's active roots. When a fiber
    yields, its roots get copied out to the fiber's saved_roots buffer
@@ -719,6 +729,10 @@ static void **sp_gc_roots[SP_GC_STACK_MAX]; static int sp_gc_nroots = 0;
    as use-after-scope on inputs that nest scan_locals deeply (issue
    surfaced on test/block2.rb under clang-built spinel_codegen). */
 static inline int _sp_gc_root_push(void **p) {
+  if (!sp_gc_roots) {
+    sp_gc_roots = (void ***)malloc(sizeof(void **) * SP_GC_STACK_MAX);
+    if (!sp_gc_roots) return 0;
+  }
   if (sp_gc_nroots < SP_GC_STACK_MAX) { sp_gc_roots[sp_gc_nroots++] = p; return 1; }
   return 0;
 }
@@ -739,7 +753,7 @@ static inline void _sp_gc_root_pop(int *added) { if (*added) sp_gc_nroots--; }
 #define SP_GC_ROOT_RBVAL(v) int __attribute__((cleanup(_sp_gc_root_pop))) _SP_GC_CONCAT(_sp_gcr_, __COUNTER__) = _sp_gc_root_push((void**)((uintptr_t)&(v) | (uintptr_t)1))
 #define SP_GC_RESTORE() sp_gc_nroots = _gc_saved
 #define SP_GC_MARK_STACK_MAX (1024*64)
-static void**sp_gc_mark_stack=NULL;static int sp_gc_mark_top=0;
+static __thread void**sp_gc_mark_stack=NULL;static __thread int sp_gc_mark_top=0;
 /* Tag bytes on the byte preceding `obj`:
  *   0xfe : heap-allocated string (sp_str_alloc), unmarked -> bump to 0xfc.
  *   0xfc : heap string already marked this cycle -> skip.
@@ -772,10 +786,10 @@ static inline void sp_gc_mark_root_entry(void**e);
 static void sp_gc_mark_all(void){if(!sp_gc_mark_stack)sp_gc_mark_stack=(void**)malloc(sizeof(void*)*SP_GC_MARK_STACK_MAX);sp_gc_mark_top=0;if(sp_gc_verify)sp_gc_verify_snapshot();for(int i=0;i<sp_gc_nroots;i++){void**e=sp_gc_roots[i];if((uintptr_t)e&(uintptr_t)1){sp_gc_mark_root_entry(e);}else{void*obj=*e;if(obj)sp_gc_mark(obj);}}if(sp_gc_mark_suspended_fibers_hook)sp_gc_mark_suspended_fibers_hook();sp_re_mark_globals();while(sp_gc_mark_top>0){void*obj=sp_gc_mark_stack[--sp_gc_mark_top];sp_gc_hdr*h=(sp_gc_hdr*)((char*)obj-sizeof(sp_gc_hdr));if(h->scan)h->scan(obj);}}
 static void sp_gc_cleanup(int*p){sp_gc_nroots=*p;}
 #define SP_GC_NBUCKETS 32
-static sp_gc_hdr*sp_gc_buckets[SP_GC_NBUCKETS];
+static __thread sp_gc_hdr*sp_gc_buckets[SP_GC_NBUCKETS];
 static inline int sp_gc_bucket(size_t sz){int b=(int)(sz/16);return b<SP_GC_NBUCKETS?b:SP_GC_NBUCKETS-1;}
-static int sp_gc_cycle=0;
-static sp_gc_hdr*sp_gc_old_heap=NULL;static size_t sp_gc_old_bytes=0;
+static __thread int sp_gc_cycle=0;
+static __thread sp_gc_hdr*sp_gc_old_heap=NULL;static __thread size_t sp_gc_old_bytes=0;
 
 /* GC verify support (only touched when SPINEL_GC_VERIFY=1). A sorted
  * snapshot of every registered header, taken at the start of each mark, so
@@ -783,7 +797,7 @@ static sp_gc_hdr*sp_gc_old_heap=NULL;static size_t sp_gc_old_bytes=0;
  * has not run yet, so every legitimately-reachable object is still linked in
  * sp_gc_heap / sp_gc_old_heap; a pointer reached by the collector that is NOT
  * present is therefore a non-object (raw/aliased) on the mark path. */
-static sp_gc_hdr **sp_gc_vsnap = NULL; static size_t sp_gc_vsnap_n = 0, sp_gc_vsnap_cap = 0;
+static __thread sp_gc_hdr **sp_gc_vsnap = NULL; static __thread size_t sp_gc_vsnap_n = 0, sp_gc_vsnap_cap = 0;
 /* Compare by integer address: relational comparison of pointers from
  * distinct allocations is UB in C, so cast to uintptr_t first. */
 static int sp_gc_vsnap_cmp(const void *a, const void *b){ uintptr_t x=(uintptr_t)*(sp_gc_hdr*const*)a, y=(uintptr_t)*(sp_gc_hdr*const*)b; return x<y?-1:x>y?1:0; }
@@ -879,14 +893,18 @@ static void sp_gc_pool_relink(sp_gc_hdr *h) {
    (uniform across classes). SP_POOL_REPORT=1 dumps per-class stats
    at exit. */
 #define SP_POOL_DEFAULT_MAX 1048576L
+/* Ractor isolation (RFC): pooled slots are recycled into the owning
+   thread's private heap, so the free-list and its counters are __thread.
+   pool_max is a shared read-mostly tuning knob (set once from SP_POOL_MAX
+   by the constructor on the main thread). */
 #define SP_POOL_DEFINE(CLS) \
-  static sp_gc_hdr *sp_##CLS##_pool_head = NULL; \
-  static long sp_##CLS##_pool_count = 0; \
+  static __thread sp_gc_hdr *sp_##CLS##_pool_head = NULL; \
+  static __thread long sp_##CLS##_pool_count = 0; \
   static long sp_##CLS##_pool_max = SP_POOL_DEFAULT_MAX; \
-  static long sp_##CLS##_pool_pushes = 0; \
-  static long sp_##CLS##_pool_pops = 0; \
-  static long sp_##CLS##_pool_freed = 0; \
-  static long sp_##CLS##_pool_hwm = 0; \
+  static __thread long sp_##CLS##_pool_pushes = 0; \
+  static __thread long sp_##CLS##_pool_pops = 0; \
+  static __thread long sp_##CLS##_pool_freed = 0; \
+  static __thread long sp_##CLS##_pool_hwm = 0; \
   __attribute__((constructor)) static void sp_##CLS##_pool_init(void) { \
     const char *m = getenv("SP_POOL_MAX"); \
     if (m && *m) { long v = atol(m); if (v >= 0) sp_##CLS##_pool_max = v; } \
@@ -1988,9 +2006,10 @@ mrb_regexp_pattern* re_compile(const char *pattern, int64_t len, uint32_t flags)
 void re_free(mrb_regexp_pattern *pat);
 int re_exec(const mrb_regexp_pattern *pat, const char *str, int64_t len, int64_t start, int *captures, int captures_size);
 
-/* Regexp globals: $1-$9 captures */
-static const char *sp_re_captures[10] = {0};
-static int sp_re_caps[64];
+/* Regexp globals: $1-$9 captures. Per-Ractor (RFC): $~ and friends are
+   thread-local match state. */
+static __thread const char *sp_re_captures[10] = {0};
+static __thread int sp_re_caps[64];
 /* NULL (not "") so sp_mark_string's null-guard handles the unset case
    without reaching the `s[-1]` access. The rodata `""` literal would
    trigger -Wstringop-overflow under -O3 + sp_mark_string inlining at
@@ -3418,11 +3437,14 @@ static const char *sp_json_val(sp_RbVal v) {
 
 #include <setjmp.h>
 #define SP_EXC_STACK_MAX 64
-static jmp_buf sp_exc_stack[SP_EXC_STACK_MAX];
-static const char *sp_exc_msg[SP_EXC_STACK_MAX];
-static volatile int sp_exc_top = 0;
-static const char *sp_exc_cls[SP_EXC_STACK_MAX];
-static volatile const char *sp_last_exc_cls = sp_str_empty;
+/* Ractor isolation (RFC): each thread has its own exception unwinding
+   stack, so an exception raised in one Ractor never longjmps across into
+   another. */
+static __thread jmp_buf sp_exc_stack[SP_EXC_STACK_MAX];
+static __thread const char *sp_exc_msg[SP_EXC_STACK_MAX];
+static __thread volatile int sp_exc_top = 0;
+static __thread const char *sp_exc_cls[SP_EXC_STACK_MAX];
+static __thread volatile const char *sp_last_exc_cls = sp_str_empty;
 /* ---- Native backtrace formatting (spinel --debug) ---------------------- */
 /* True for sp_<name> symbols that are runtime helpers, not user Ruby methods.
    A denylist of the lowercase runtime prefixes; user methods are sp_<rubyname>
@@ -3642,10 +3664,10 @@ void sp_bigint_raise_zerodiv(const char *msg) { sp_raise_cls("ZeroDivisionError"
 static mrb_bool sp_exc_is_a(const char *cls, const char *target) { return strcmp(cls, target) == 0; }
 
 #define SP_CATCH_STACK_MAX 64
-static jmp_buf sp_catch_stack[SP_CATCH_STACK_MAX];
-static const char *sp_catch_tag[SP_CATCH_STACK_MAX];
-static mrb_int sp_catch_val[SP_CATCH_STACK_MAX];
-static volatile int sp_catch_top = 0;
+static __thread jmp_buf sp_catch_stack[SP_CATCH_STACK_MAX];
+static __thread const char *sp_catch_tag[SP_CATCH_STACK_MAX];
+static __thread mrb_int sp_catch_val[SP_CATCH_STACK_MAX];
+static __thread volatile int sp_catch_top = 0;
 static void sp_throw(const char *tag, mrb_int val) { int i = sp_catch_top - 1; while (i >= 0) { if (strcmp(sp_catch_tag[i], tag) == 0) { sp_catch_val[i] = val; sp_catch_top = i + 1; longjmp(sp_catch_stack[i], 1); } i--; } fprintf(stderr, "uncaught throw: %s\n", tag); exit(1); }
 
 /* Kernel#sleep with sub-second precision. Argument is seconds as a
@@ -4081,8 +4103,8 @@ static sp_StrArray *sp_StrArray_slice_bang(sp_StrArray *a, mrb_int from, mrb_int
    order before returning. */
 #define SP_AT_EXIT_MAX 256
 struct sp_Proc;
-static struct sp_Proc *sp_at_exit_hooks[SP_AT_EXIT_MAX];
-static mrb_int sp_at_exit_count = 0;
+static __thread struct sp_Proc *sp_at_exit_hooks[SP_AT_EXIT_MAX];
+static __thread mrb_int sp_at_exit_count = 0;
 static sp_PtrArray *sp_PtrArray_slice_bang(sp_PtrArray *a, mrb_int from, mrb_int n) {
   if (!a) return sp_PtrArray_new_scan(NULL);
   if (a->frozen) { sp_raise_frozen_array(); return sp_PtrArray_new_scan(a->scan_elem); }
@@ -4229,7 +4251,7 @@ struct sp_Val { enum { SP_PROC2, SP_INT2, SP_BOOL2, SP_NIL2 } tag; union { struc
 #else
 #define SP_ARENA_SIZE ((size_t)16ULL * 1024 * 1024 * 1024)
 #endif
-static char *sp_arena = NULL; static size_t sp_arena_pos = 0;
+static __thread char *sp_arena = NULL; static __thread size_t sp_arena_pos = 0;
 static void *sp_lam_alloc(size_t sz) { sz = (sz + 7) & ~(size_t)7; if (!sp_arena) { sp_arena = (char *)mmap(NULL, SP_ARENA_SIZE, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE, -1, 0); if (sp_arena == MAP_FAILED) { perror("mmap"); exit(1); } sp_arena_pos = 0; } if (sp_arena_pos + sz > SP_ARENA_SIZE) { fprintf(stderr, "arena exhausted\n"); exit(1); } void *p = sp_arena + sp_arena_pos; sp_arena_pos += sz; return p; }
 static sp_Val *sp_lam_proc(sp_fn_t fn, int ncap) { sp_Val *v = (sp_Val *)sp_lam_alloc(sizeof(sp_Val) + sizeof(sp_Val *) * ncap); v->tag = SP_PROC2; v->u.proc.fn = fn; v->u.proc.ncaptures = ncap; return v; }
 static sp_Val *sp_lam_int(mrb_int n) { sp_Val *v = (sp_Val *)sp_lam_alloc(sizeof(sp_Val)); v->tag = SP_INT2; v->u.ival = n; return v; }
@@ -4281,9 +4303,14 @@ static mrb_int sp_lam_to_int(sp_Val *v) { return v->u.ival; }
 #ifdef _WIN32
 #define SP_FIBER_STACK_SIZE (64*1024)
 typedef struct sp_Fiber{LPVOID ctx;LPVOID caller_ctx;char*stack;int state;int transferred;sp_RbVal yielded_value;sp_RbVal resumed_value;void(*body)(struct sp_Fiber*);void*user_data;int saved_exc_top;int saved_catch_top;struct sp_Fiber*caller;sp_SymPolyHash*storage;void***saved_roots;int saved_nroots;int saved_roots_cap;struct sp_Fiber*fiber_next;struct sp_Fiber*fiber_prev;}sp_Fiber;
-static sp_Fiber sp_fiber_root;
-static sp_Fiber*sp_fiber_current=&sp_fiber_root;
-static sp_Fiber*sp_fiber_list_head=NULL;
+/* Ractor isolation (RFC): fibers never migrate across threads, so each
+   thread owns a synthetic root fiber, a current pointer and a fiber list.
+   sp_fiber_current cannot be statically initialised to &sp_fiber_root
+   (the address of a __thread var is not a constant expression), so it
+   starts NULL and is wired to &sp_fiber_root by sp_thread_init(). */
+static __thread sp_Fiber sp_fiber_root;
+static __thread sp_Fiber*sp_fiber_current=NULL;
+static __thread sp_Fiber*sp_fiber_list_head=NULL;
 /* Per-fiber root save/restore (issue #636). On fiber switch, the
    outgoing fiber's active root window gets memcpy'd into its
    saved_roots buffer and the incoming fiber's saved_roots get
@@ -4322,9 +4349,11 @@ static sp_RbVal sp_Fiber_transfer(sp_Fiber*f,sp_RbVal val){sp_fiber_ensure_root(
 #include <sys/mman.h>
 #define SP_FIBER_STACK_SIZE (64*1024)
 typedef struct sp_Fiber{ucontext_t ctx;ucontext_t caller_ctx;char*stack;int state;int transferred;sp_RbVal yielded_value;sp_RbVal resumed_value;void(*body)(struct sp_Fiber*);void*user_data;int saved_exc_top;int saved_catch_top;sp_SymPolyHash*storage;void***saved_roots;int saved_nroots;int saved_roots_cap;struct sp_Fiber*fiber_next;struct sp_Fiber*fiber_prev;}sp_Fiber;
-static sp_Fiber sp_fiber_root;
-static sp_Fiber*sp_fiber_current=&sp_fiber_root;
-static sp_Fiber*sp_fiber_list_head=NULL;
+/* Ractor isolation (RFC): see Windows-branch note above. sp_fiber_current
+   is NULL-initialised and wired to &sp_fiber_root by sp_thread_init(). */
+static __thread sp_Fiber sp_fiber_root;
+static __thread sp_Fiber*sp_fiber_current=NULL;
+static __thread sp_Fiber*sp_fiber_list_head=NULL;
 /* Per-fiber root save/restore — see Windows variant above for
    rationale (issue #636). */
 /* Issue #761: capture realloc into a temp and only commit on success
@@ -4358,6 +4387,167 @@ static mrb_bool sp_Fiber_alive(sp_Fiber*f){return f->state!=3;}
 static sp_RbVal sp_Fiber_transfer(sp_Fiber*f,sp_RbVal val){f->resumed_value=val;sp_Fiber*prev=sp_fiber_current;sp_fiber_save_roots(prev);sp_fiber_restore_roots(f);sp_fiber_current=f;if(f->state==0){f->state=1;f->transferred=1;getcontext(&f->ctx);f->ctx.uc_stack.ss_sp=f->stack;f->ctx.uc_stack.ss_size=SP_FIBER_STACK_SIZE;f->ctx.uc_link=&prev->ctx;makecontext(&f->ctx,(void(*)(void))sp_fiber_trampoline,0);swapcontext(&prev->ctx,&f->ctx);}else{f->state=1;swapcontext(&prev->ctx,&f->ctx);}sp_fiber_save_roots(f);sp_fiber_restore_roots(prev);sp_fiber_current=prev;return prev->resumed_value;}
 #endif
 static void sp_mark_fiber_root_storage(void){if(sp_fiber_root.storage)sp_gc_mark(sp_fiber_root.storage);}
+
+/* Per-thread runtime init (RFC). Wires the thread-local fiber pointer to
+   this thread's synthetic root fiber. Roots array and mark stack
+   self-allocate lazily (see _sp_gc_root_push / sp_gc_mark_all), so they
+   need no work here. Idempotent. Run once per thread: on the main thread
+   via the constructor below (before main()), and on each Ractor thread
+   from its trampoline. */
+static void sp_thread_init(void){
+  if (!sp_fiber_current) sp_fiber_current = &sp_fiber_root;
+}
+__attribute__((constructor)) static void sp_main_thread_init(void){ sp_thread_init(); }
+
+/* ===================================================================
+   Ractor runtime (RFC, Milestone 1)
+
+   A Ractor is "a Proc body run on a pthread, with mailbox/yield queues
+   instead of a Fiber's resume/yield slots, and values deep-copied at the
+   boundary." Each Ractor thread owns a private GC heap (the __thread
+   state above), so collection is independent and lock-free; only the
+   message queues are shared, each guarded by its own mutex + condvar.
+
+   Scope of this milestone: the value codec carries scalars only
+   (Integer / Float / true / false / nil). Strings, Symbols, and
+   containers are deferred (sp_ractor_serialize raises for them), and the
+   mailbox/outgoing queues are single-slot with backpressure rather than
+   CRuby's unbounded mailbox. These are documented simplifications, not
+   dead ends — the partition that makes them work is the point of the RFC.
+   =================================================================== */
+#ifndef _WIN32
+#include <pthread.h>
+
+/* Heap-neutral, pointer-free serialized value. Scalars are self-contained
+   in the sp_RbVal union, so the buffer is a flat malloc'd struct with no
+   pointers into any GC heap — safe to hand from one Ractor to another. */
+typedef struct sp_RactorMsg { int tag; int cls_id; mrb_int i; mrb_float f; } sp_RactorMsg;
+
+static mrb_bool sp_ractor_shareable(sp_RbVal v){
+  switch(v.tag){ case SP_TAG_INT: case SP_TAG_FLT: case SP_TAG_BOOL: case SP_TAG_NIL: return 1; default: return 0; }
+}
+static sp_RactorMsg *sp_ractor_serialize(sp_RbVal v){
+  if(!sp_ractor_shareable(v)) sp_raise_cls("Ractor::Error","only scalar values (Integer/Float/true/false/nil) can cross a Ractor boundary in this build");
+  sp_RactorMsg *m=(sp_RactorMsg*)calloc(1,sizeof(sp_RactorMsg)); if(!m)sp_oom_die();
+  m->tag=v.tag; m->cls_id=v.cls_id;
+  if(v.tag==SP_TAG_FLT) m->f=v.v.f; else m->i=v.v.i;
+  return m;
+}
+static sp_RbVal sp_ractor_deserialize(sp_RactorMsg *m){
+  sp_RbVal r; r.tag=m->tag; r.cls_id=m->cls_id; r.v.i=0;
+  if(m->tag==SP_TAG_FLT) r.v.f=m->f; else r.v.i=m->i;
+  return r;
+}
+
+/* Single-slot blocking queue (mutex + condvar). push() blocks while a
+   value is already pending (backpressure); pop() blocks until a value is
+   available or the queue is closed. */
+typedef struct sp_RactorQueue { pthread_mutex_t mtx; pthread_cond_t cv; void *buf; int has_value; int closed; } sp_RactorQueue;
+static void sp_ractor_queue_init(sp_RactorQueue*q){ pthread_mutex_init(&q->mtx,NULL); pthread_cond_init(&q->cv,NULL); q->buf=NULL; q->has_value=0; q->closed=0; }
+static void sp_ractor_queue_push(sp_RactorQueue*q, void*buf){
+  pthread_mutex_lock(&q->mtx);
+  while(q->has_value && !q->closed) pthread_cond_wait(&q->cv,&q->mtx);
+  if(q->closed){ pthread_mutex_unlock(&q->mtx); free(buf); return; }
+  q->buf=buf; q->has_value=1; pthread_cond_signal(&q->cv);
+  pthread_mutex_unlock(&q->mtx);
+}
+static void *sp_ractor_queue_pop(sp_RactorQueue*q, int*got){
+  pthread_mutex_lock(&q->mtx);
+  while(!q->has_value && !q->closed) pthread_cond_wait(&q->cv,&q->mtx);
+  void*buf=NULL;
+  if(q->has_value){ buf=q->buf; q->buf=NULL; q->has_value=0; *got=1; pthread_cond_signal(&q->cv); }
+  else *got=0;
+  pthread_mutex_unlock(&q->mtx);
+  return buf;
+}
+static void sp_ractor_queue_close(sp_RactorQueue*q){ pthread_mutex_lock(&q->mtx); q->closed=1; pthread_cond_broadcast(&q->cv); pthread_mutex_unlock(&q->mtx); }
+
+typedef struct sp_RactorCtrl {
+  pthread_t thread;
+  int refcount;            /* parent handle + child thread; freed at 0 */
+  pthread_mutex_t rc_mtx;
+  sp_RactorQueue inbox;    /* parent -> child : r.send / Ractor.receive */
+  sp_RactorQueue outbox;   /* child -> parent : Ractor.yield / r.take   */
+  void (*body)(struct sp_RactorCtrl*);
+  int failed;              /* body terminated via an uncaught exception */
+  char *exc_cls;           /* malloc'd copies, re-raised in the taker    */
+  char *exc_msg;
+} sp_RactorCtrl;
+
+typedef struct sp_Ractor { sp_RactorCtrl *ctrl; } sp_Ractor;
+
+/* The Ractor whose body is running on THIS thread (NULL on the main
+   thread). Ractor.receive / Ractor.yield act on its queues. */
+static __thread sp_RactorCtrl *sp_current_ractor = NULL;
+
+static void sp_ractor_ctrl_release(sp_RactorCtrl *c){
+  pthread_mutex_lock(&c->rc_mtx);
+  int n=--c->refcount;
+  pthread_mutex_unlock(&c->rc_mtx);
+  if(n==0){
+    pthread_mutex_destroy(&c->rc_mtx);
+    if(c->exc_cls) free(c->exc_cls);
+    if(c->exc_msg) free(c->exc_msg);
+    free(c);
+  }
+}
+static void sp_Ractor_fin(void*p){ sp_Ractor*r=(sp_Ractor*)p; if(r->ctrl) sp_ractor_ctrl_release(r->ctrl); }
+
+static void *sp_ractor_thread_entry(void *arg){
+  sp_RactorCtrl *c=(sp_RactorCtrl*)arg;
+  sp_thread_init();              /* fresh thread-local GC heap + fiber root */
+  sp_current_ractor=c;
+  /* Top-level landing pad: an uncaught exception terminates THIS Ractor
+     (instead of exit(1)-ing the process) and is re-raised in the taker. */
+  sp_exc_top++;
+  if(setjmp(sp_exc_stack[sp_exc_top-1])==0){
+    c->body(c);
+  } else {
+    c->failed=1;
+    const char *cls=sp_exc_cls[sp_exc_top-1]; const char *msg=sp_exc_msg[sp_exc_top-1];
+    if(cls){ size_t n=strlen(cls); c->exc_cls=(char*)malloc(n+1); if(c->exc_cls) memcpy(c->exc_cls,cls,n+1); }
+    if(msg){ size_t n=strlen(msg); c->exc_msg=(char*)malloc(n+1); if(c->exc_msg) memcpy(c->exc_msg,msg,n+1); }
+  }
+  sp_exc_top--;
+  sp_ractor_queue_close(&c->outbox);
+  sp_ractor_ctrl_release(c);
+  return NULL;
+}
+
+static sp_Ractor *sp_ractor_new(void (*body)(sp_RactorCtrl*)){
+  sp_RactorCtrl *c=(sp_RactorCtrl*)calloc(1,sizeof(sp_RactorCtrl)); if(!c)sp_oom_die();
+  c->refcount=2; pthread_mutex_init(&c->rc_mtx,NULL);
+  sp_ractor_queue_init(&c->inbox); sp_ractor_queue_init(&c->outbox);
+  c->body=body;
+  sp_Ractor *r=(sp_Ractor*)sp_gc_alloc(sizeof(sp_Ractor),sp_Ractor_fin,NULL);
+  r->ctrl=c;
+  if(pthread_create(&c->thread,NULL,sp_ractor_thread_entry,c)!=0){ c->refcount=1; sp_raise_cls("Ractor::Error","failed to create Ractor thread"); }
+  pthread_detach(c->thread);
+  return r;
+}
+
+/* r.send(v) / r << v : push into the child's inbox. */
+static sp_Ractor *sp_ractor_send(sp_Ractor *r, sp_RbVal v){ sp_ractor_queue_push(&r->ctrl->inbox, sp_ractor_serialize(v)); return r; }
+/* Ractor.receive : pop from the running Ractor's inbox. */
+static sp_RbVal sp_ractor_receive(void){
+  if(!sp_current_ractor) sp_raise_cls("Ractor::Error","Ractor.receive called outside a Ractor");
+  int got=0; sp_RactorMsg *m=(sp_RactorMsg*)sp_ractor_queue_pop(&sp_current_ractor->inbox,&got);
+  if(!got) return sp_box_nil();
+  sp_RbVal v=sp_ractor_deserialize(m); free(m); return v;
+}
+/* Ractor.yield(v) : push into the running Ractor's outbox. */
+static sp_RbVal sp_ractor_yield(sp_RbVal v){
+  if(!sp_current_ractor) sp_raise_cls("Ractor::Error","Ractor.yield called outside a Ractor");
+  sp_ractor_queue_push(&sp_current_ractor->outbox, sp_ractor_serialize(v)); return sp_box_nil();
+}
+/* r.take : pop from the child's outbox; re-raise if the body failed. */
+static sp_RbVal sp_ractor_take(sp_Ractor *r){
+  int got=0; sp_RactorMsg *m=(sp_RactorMsg*)sp_ractor_queue_pop(&r->ctrl->outbox,&got);
+  if(got){ sp_RbVal v=sp_ractor_deserialize(m); free(m); return v; }
+  if(r->ctrl->failed) sp_raise_cls(r->ctrl->exc_cls?r->ctrl->exc_cls:"Ractor::Error", r->ctrl->exc_msg?r->ctrl->exc_msg:"Ractor terminated with exception");
+  return sp_box_nil();
+}
+#endif /* !_WIN32 */
 
 /* Bigint (linked from sp_bigint.o) */
 typedef struct sp_Bigint sp_Bigint;
