@@ -43,8 +43,12 @@
 static int sp_bt_enabled = 0;          /* set to 1 by debug-build main() */
 static const char *sp_bt_srcfile = ""; /* toplevel .rb path, set by debug main() */
 #if SP_BT_AVAILABLE
-static void *sp_bt_buf[256];       /* frames captured at the last raise */
-static int sp_bt_n = 0;
+/* __thread: each Ractor raises on its own thread, so concurrent raises
+   must not race on the shared backtrace scratch (only matters when
+   sp_bt_enabled, i.e. debug builds). sp_bt_enabled itself is write-once
+   at startup and stays shared. */
+static __thread void *sp_bt_buf[256];  /* frames captured at the last raise */
+static __thread int sp_bt_n = 0;
 #endif
 #ifdef _WIN32
 #include <windows.h>
@@ -897,6 +901,23 @@ static void sp_gc_pool_relink(sp_gc_hdr *h) {
    thread's private heap, so the free-list and its counters are __thread.
    pool_max is a shared read-mostly tuning knob (set once from SP_POOL_MAX
    by the constructor on the main thread). */
+/* Pool drain registry. Each pool's free-list is __thread, so a Ractor
+   thread must drain its OWN pooled chunks before it exits (default cap is
+   1M chunks/class — a large per-thread leak otherwise). Pools are emitted
+   one-per-class in generated code, so each registers a drain fn here. The
+   registry is process-global but written only by the __attribute__((
+   constructor)) inits, which all run on the main thread before any Ractor
+   is spawned, then it is read-only — so no lock. Each registered fn
+   operates on the CALLING thread's __thread free-list head. */
+#define SP_MAX_POOL_DRAINS 8192
+static void (*sp_pool_drains[SP_MAX_POOL_DRAINS])(void);
+static int sp_pool_drains_n = 0;
+static void sp_pool_register_drain(void (*f)(void)) {
+  if (sp_pool_drains_n < SP_MAX_POOL_DRAINS) sp_pool_drains[sp_pool_drains_n++] = f;
+}
+static void sp_pools_drain_all(void) {
+  int i; for (i = 0; i < sp_pool_drains_n; i++) sp_pool_drains[i]();
+}
 #define SP_POOL_DEFINE(CLS) \
   static __thread sp_gc_hdr *sp_##CLS##_pool_head = NULL; \
   static __thread long sp_##CLS##_pool_count = 0; \
@@ -905,9 +926,15 @@ static void sp_gc_pool_relink(sp_gc_hdr *h) {
   static __thread long sp_##CLS##_pool_pops = 0; \
   static __thread long sp_##CLS##_pool_freed = 0; \
   static __thread long sp_##CLS##_pool_hwm = 0; \
+  static void sp_##CLS##_pool_drain(void) { \
+    sp_gc_hdr *h = sp_##CLS##_pool_head; \
+    while (h) { sp_gc_hdr *nx = h->next; free(h); h = nx; } \
+    sp_##CLS##_pool_head = NULL; sp_##CLS##_pool_count = 0; \
+  } \
   __attribute__((constructor)) static void sp_##CLS##_pool_init(void) { \
     const char *m = getenv("SP_POOL_MAX"); \
     if (m && *m) { long v = atol(m); if (v >= 0) sp_##CLS##_pool_max = v; } \
+    sp_pool_register_drain(sp_##CLS##_pool_drain); \
   } \
   static void sp_##CLS##_pool_recycle(sp_gc_hdr *h) { \
     if (sp_##CLS##_pool_count >= sp_##CLS##_pool_max) { \
@@ -4486,12 +4513,48 @@ static void sp_ractor_ctrl_release(sp_RactorCtrl *c){
   pthread_mutex_unlock(&c->rc_mtx);
   if(n==0){
     pthread_mutex_destroy(&c->rc_mtx);
+    /* the queues' mutex+condvar are init'd in sp_ractor_queue_init and
+       outlive every waiter (refcount hits 0 only after the body thread
+       has exited and the Ractor object was finalized), so destroy them
+       here; free any message that was produced but never consumed. */
+    if(c->inbox.buf) free(c->inbox.buf);
+    if(c->outbox.buf) free(c->outbox.buf);
+    pthread_mutex_destroy(&c->inbox.mtx);  pthread_cond_destroy(&c->inbox.cv);
+    pthread_mutex_destroy(&c->outbox.mtx); pthread_cond_destroy(&c->outbox.cv);
     if(c->exc_cls) free(c->exc_cls);
     if(c->exc_msg) free(c->exc_msg);
     free(c);
   }
 }
 static void sp_Ractor_fin(void*p){ sp_Ractor*r=(sp_Ractor*)p; if(r->ctrl) sp_ractor_ctrl_release(r->ctrl); }
+
+/* Reclaim every thread-local allocation before a Ractor thread exits.
+   Ractors are isolated — nothing here is reachable from another thread
+   (values sent across the boundary are deep-copied into heap-neutral
+   message buffers), so a flat teardown is safe. Finalizers ARE run:
+   Spinel's finalizers only release their object's own external storage
+   (fiber stacks via munmap, array/string backing buffers, child-Ractor
+   ctrl refs) and never traverse the GC graph, so order is irrelevant and
+   skipping them would leak those buffers. Pooled chunks carry no
+   finalizer (fin==NULL) and are drained via the pool registry; a chunk
+   is on a pool free-list XOR in a heap, never both, so no double free.
+   (sp_gc_buckets[] is vestigial/unpopulated, so it needs no drain.) */
+static void sp_thread_cleanup(void){
+  sp_gc_hdr *h = sp_gc_heap;
+  while(h){ sp_gc_hdr *nx=h->next; if(h->finalize) h->finalize((char*)h+sizeof(sp_gc_hdr)); free(h); h=nx; }
+  sp_gc_heap = NULL;
+  h = sp_gc_old_heap;
+  while(h){ sp_gc_hdr *nx=h->next; if(h->finalize) h->finalize((char*)h+sizeof(sp_gc_hdr)); free(h); h=nx; }
+  sp_gc_old_heap = NULL;
+  sp_gc_bytes = 0; sp_gc_old_bytes = 0;
+  sp_pools_drain_all();                 /* per-class recycled free-lists */
+  { sp_str_hdr *s=sp_str_heap; while(s){ sp_str_hdr *nx=s->next; free(s); s=nx; } sp_str_heap=NULL; }
+  if(sp_gc_roots){ free(sp_gc_roots); sp_gc_roots=NULL; } sp_gc_nroots=0;
+  if(sp_gc_mark_stack){ free(sp_gc_mark_stack); sp_gc_mark_stack=NULL; } sp_gc_mark_top=0;
+  if(sp_gc_vsnap){ free(sp_gc_vsnap); sp_gc_vsnap=NULL; sp_gc_vsnap_n=0; sp_gc_vsnap_cap=0; }
+  if(sp_fiber_root.saved_roots){ free(sp_fiber_root.saved_roots); sp_fiber_root.saved_roots=NULL; sp_fiber_root.saved_nroots=0; sp_fiber_root.saved_roots_cap=0; }
+  if(sp_arena){ munmap(sp_arena, SP_ARENA_SIZE); sp_arena=NULL; sp_arena_pos=0; }
+}
 
 static void *sp_ractor_thread_entry(void *arg){
   sp_RactorCtrl *c=(sp_RactorCtrl*)arg;
@@ -4511,6 +4574,7 @@ static void *sp_ractor_thread_entry(void *arg){
   sp_exc_top--;
   sp_ractor_queue_close(&c->outbox);
   sp_ractor_ctrl_release(c);
+  sp_thread_cleanup();          /* free this Ractor's thread-local heaps */
   return NULL;
 }
 
