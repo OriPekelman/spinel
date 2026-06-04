@@ -27731,6 +27731,22 @@ class Compiler
       if mname == "dup" || mname == "clone"
         return "sp_IntIntHash_dup(" + rc + ")"
       end
+ # Non-block fetch(k) / fetch(k, default). The block form is handled
+ # by the shared hash_fetch_block_info arm above; this mirrors the
+ # int_str_hash arm for the int-valued variant. Issue #914 raise on
+ # miss when no default is given.
+      if mname == "fetch"
+        args_id = @nd_arguments[nid]
+        if args_id >= 0
+          aargs = get_args(args_id)
+          key = compile_arg0_as_int(nid)
+          if aargs.length >= 2
+            defval = compile_expr(aargs[1])
+            return "(sp_IntIntHash_has_key(" + rc + ", " + key + ") ? sp_IntIntHash_get(" + rc + ", " + key + ") : " + defval + ")"
+          end
+          return "(sp_IntIntHash_has_key(" + rc + ", " + key + ") ? sp_IntIntHash_get(" + rc + ", " + key + ") : (sp_raise_cls(\"KeyError\", \"key not found\"), (mrb_int)0))"
+        end
+      end
     end
     if recv_type == "int_str_hash"
       @needs_int_str_hash = 1
