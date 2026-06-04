@@ -27990,22 +27990,37 @@ class Compiler
  # (the dispatch method is large and adding scope tripped
  # self-host scan_locals; see feedback_self_host_recursive_fn_arm).
   def reduce_sym_op_for(nid)
+ # `reduce(:+)` -- the operator symbol as a positional argument.
     args_id = @nd_arguments[nid]
-    if args_id < 0
-      return ""
+    if args_id >= 0
+      args = get_args(args_id)
+      if args.length == 1 && @nd_type[args[0]] == "SymbolNode"
+        op_a = @nd_content[args[0]]
+        if reduce_arith_op?(op_a) == 1
+          return op_a
+        end
+      end
     end
-    args = get_args(args_id)
-    if args.length != 1
-      return ""
-    end
-    if @nd_type[args[0]] != "SymbolNode"
-      return ""
-    end
-    op = @nd_content[args[0]]
-    if op == "+" || op == "*" || op == "-" || op == "/" || op == "%" || op == "&" || op == "|" || op == "^"
-      return op
+ # `inject(&:+)` -- the same operator as a symbol-to-proc block. The symbol
+ # is the inner expression of the BlockArgumentNode, not a positional arg.
+    blk = @nd_block[nid]
+    if blk >= 0 && @nd_type[blk] == "BlockArgumentNode"
+      inner = @nd_expression[blk]
+      if inner >= 0 && @nd_type[inner] == "SymbolNode"
+        op_b = @nd_content[inner]
+        if reduce_arith_op?(op_b) == 1
+          return op_b
+        end
+      end
     end
     ""
+  end
+
+  def reduce_arith_op?(op)
+    if op == "+" || op == "*" || op == "-" || op == "/" || op == "%" || op == "&" || op == "|" || op == "^"
+      return 1
+    end
+    0
   end
 
  # 1 if `mname` is a Math module function taking exactly one
