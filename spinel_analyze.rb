@@ -2950,12 +2950,19 @@ class Compiler
       while k < elems.length
         et2 = infer_type(elems[k])
         if et2 != et
+ # int and int? share mrb_int storage (the nil lives in-band as
+ # SP_INT_NIL), so a mixed `[int, int?]` literal is still an int_array.
+ # The #1180 Array#[]->int? flip makes an element read int? where it
+ # used to be int (`[1, buf[8]]`), and without this the literal
+ # collapses to poly_array and loses Array#max/#min/etc.
+          if base_type(et) == "int" && base_type(et2) == "int"
+ # compatible; continue
  # Under promote mode, int / bigint are numerically interchangeable
  # (the literal codegen unboxes via sp_bigint_to_int for IntArray
  # storage). Stale-int cache on an arith CallNode whose actual
  # value is bigint causes a spurious mismatch here -- recognize
  # int<>bigint as compatible.
-          if @int_overflow_mode == "promote" && (et == "int" || et == "bigint") && (et2 == "int" || et2 == "bigint")
+          elsif @int_overflow_mode == "promote" && (et == "int" || et == "bigint") && (et2 == "int" || et2 == "bigint")
  # compatible; continue
           else
             return "poly_array"
@@ -5315,6 +5322,17 @@ class Compiler
     if mname == "fetch"
       if recv >= 0
         rt = infer_type(recv)
+ # Typed-array fetch(i): the element is proven-present (Array#fetch
+ # raises IndexError on a miss, it never returns nil), so the result
+ # is the plain element type, not the nullable `[]` element type
+ # (#1180). This keeps the compiler's own in-bounds node-id reads
+ # (`aargs.fetch(0)`) non-null after the Array#[] -> int? flip.
+        if rt == "int_array"
+          return "int"
+        end
+        if rt == "sym_array"
+          return "symbol"
+        end
  # int-leaf hash with string default — Ruby's `params.fetch
  # "k", ""` idiom. The leaf int is convertible to string via
  # sp_int_to_s, so surface the result as string; codegen-side
@@ -6544,7 +6562,13 @@ class Compiler
               if bret == "float"
                 return "float_array"
               end
-              if bret == "int"
+              if bret == "int" || bret == "int?"
+ # A block returning a maybe-missing element (int? under the #1180
+ # Array#[]->int? flip, e.g. `each_cons(n).map { |pair| pair[0] }`)
+ # maps to an int_array: int? shares mrb_int storage, sentinel and
+ # all. Without int? parity here bret falls through to the array-of-
+ # arrays (_ptr_array) arms below and the result type diverges from
+ # the int_array codegen builds.
                 return "int_array"
               end
  # Promote-mode bigint block return: there's no bigint_array
@@ -6720,7 +6744,8 @@ class Compiler
         end
         if rt == "int_array"
  # a[range] / a[start, len] returns a slice (still int_array);
- # bare a[i] returns the element.
+ # bare a[i] returns the element, maybe-missing (OOB -> nil) so int?
+ # (sp_IntArray_get already returns SP_INT_NIL out of range). #1180.
           args_id = @nd_arguments[nid]
           if args_id >= 0
             a = get_args(args_id)
@@ -6731,7 +6756,7 @@ class Compiler
               return "int_array"
             end
           end
-          return "int"
+          return "int?"
         end
         if rt == "sym_array"
           return "symbol"
@@ -7975,6 +8000,22 @@ class Compiler
 
   def register_tuple_type(t)
     if is_tuple_type(t) == 1
+ # Canonicalize element types via base_type before dedup. A tuple of
+ # int? has identical C storage and the same tuple_c_name as a tuple
+ # of int (both -> sp_Tuple_int_int_int), so the #1180 Array#[]->int?
+ # flip must not register a separate tuple:int?,... entry: two registry
+ # entries sharing one C typedef name emit a duplicate typedef (the
+ # registry is serialized into the IR and drives codegen's typedef
+ # loop). base_type strips only the nullable "?" and keeps pointer
+ # bases, so GC tracing of pointer-element tuples is unaffected.
+      inner_rt = t[6, t.length - 6]
+      parts_rt = inner_rt.split(",", -1)
+      kk = 0
+      while kk < parts_rt.length
+        parts_rt[kk] = base_type(parts_rt[kk])
+        kk = kk + 1
+      end
+      t = "tuple:" + parts_rt.join(",")
       k = 0
       found = 0
       while k < @tuple_types.length
@@ -16108,6 +16149,20 @@ class Compiler
       end
       return at
     end
+ # int? mirror of the int placeholder rule above. An early param pass
+ # can stamp a slot int? from a transient maybe-missing array-element
+ # read -- the #1180 Array#[]->int? flip turned these placeholder reads
+ # from int into int? -- and a later concrete arg should win, exactly
+ # as it does for the bare-int default. Genuine nullable-int merges
+ # (an int / int? arg) keep int?; any other concrete arg is adopted.
+ # Without this parity, str_array/string param slots that first observe
+ # such a placeholder collapse to poly on the next real arg.
+    if old_pt == "int?"
+      if at == "int" || at == "int?"
+        return "int?"
+      end
+      return at
+    end
     if is_array_type(old_pt) == 1 && is_array_type(at) == 1
       if old_pt == "poly_array" || at == "poly_array"
         @needs_rb_value = 1
@@ -16175,6 +16230,19 @@ class Compiler
       end
  # Inferred int (likely fallback): keep existing type.
       return old_pt
+    end
+ # int? arg mirror of the inferred-int placeholder rule above. A
+ # non-literal int? arg (a maybe-missing array-element read under the
+ # #1180 flip) is as non-committal as an inferred int; it must not
+ # widen an established concrete slot to poly. A genuinely nullable-int
+ # slot is preserved by the base_type merge below (int? base == int).
+    if at == "int?"
+      if is_scalar_nullable_type(old_pt) == 1
+        return old_pt
+      end
+      if arg_is_literal == 0
+        return old_pt
+      end
     end
     if base_type(old_pt) == base_type(at)
  # Nullable-compatible variants of the same base.
@@ -22679,7 +22747,10 @@ class Compiler
     if stmts.length == 0
       return 0
     end
-    types = []
+ # str_array of return-path type names. An empty `[]` literal would
+ # infer as int_array, whose element read is now int? (#1180), so the
+ # `t` local would type mrb_int and break its sp_str_eq comparisons.
+    types = "".split(",", -1)
     collect_return_types_nid(body_id, types)
     last_id = stmts.last
     last_t = infer_type(last_id)
@@ -23903,6 +23974,31 @@ class Compiler
         return ""
       end
       return new_t
+    end
+ # int? placeholder -> concrete refinement, mirroring the bare-int
+ # rule above. The #1180 Array#[]->int? flip makes a transient pre-
+ # promotion array-element read type int? where it used to be int
+ # (e.g. `got = arr[0]` before `arr` promotes from the empty-[]
+ # int_array default to a ptr/typed array). Without parity the int?
+ # sticks and the slot keeps mrb_int storage against a pointer value
+ # (-Wint-conversion). A genuine nullable-int observation (new_t int/
+ # int?) is preserved by the new_t=="int" guard above and the nullable
+ # rules below.
+    if cur_t == "int?"
+      if new_t == "nil"
+        return ""
+      end
+ # Only adopt a concrete pointer/aggregate observation (the empty-[]
+ # int_array placeholder promoting to a ptr / typed array, e.g.
+ # `got = arr[0]` before arr's push(ptr) resolves). A scalar new_t
+ # (int / float / symbol / ...) must leave a genuine nullable-int slot
+ # intact -- adopting it would silently drop the int? nullability on a
+ # real `h[k]`-style local. Scoped narrower than the bare-int rule
+ # above precisely because int? carries the extra nil bit.
+      if return_type_is_pointer(new_t) == 1
+        return new_t
+      end
+      return ""
     end
  # nil starting type → nullable pointer. Add "?" so the C slot
  # gets NULL-init and tag handling. is_nullable_type already
@@ -27640,6 +27736,14 @@ class Compiler
  # precision the in-loop narrow pass used to give them.
     infer_hash_param_from_body
     narrow_param_hash_types_from_body_writes
+    infer_all_returns
+    infer_function_body_call_types
+    infer_class_body_call_types
+    infer_all_returns
+ # Undo any hash param locked to a poly variant by a transient int? read
+ # (the #1180 Array#[]->int? fixpoint hop), re-deriving it from settled call
+ # args. Placed after the hash params have stabilized to their poly variant.
+    renarrow_poly_hash_params_from_calls
     infer_all_returns
     infer_function_body_call_types
     infer_class_body_call_types
@@ -35524,6 +35628,136 @@ class Compiler
         @cls_meth_ptypes[ci] = all_ptypes.join("|")
       end
       ci = ci + 1
+    end
+  end
+
+ # Post-fixpoint re-pick for hash params locked to a poly variant by a
+ # transient. The #1180 Array#[]->int? flip adds a fixpoint hop: a hash
+ # literal whose values come from a yet-to-settle `arr[i]` read (int? before
+ # the array promotes to its real element type) is transiently str_poly_hash
+ # when a callee param FIRST adopts it from the int placeholder, and the
+ # monotonic `str_poly_hash || ... -> str_poly_hash` unify rule never lets a
+ # later settled str_str_hash arg narrow it back. The literal itself re-infers
+ # to str_str_hash each round (its final type is correct), so the param is the
+ # only casualty. Reset poly-hash params to the int placeholder, re-derive them
+ # purely from settled call-site args (single str_str_hash caller -> narrows to
+ # str_str_hash; genuinely heterogeneous callers -> re-widens to *_poly_hash),
+ # and restore the original poly type for any param with no direct call-site
+ # evidence (reached only through poly-receiver dispatch) so nothing is lost.
+ # A hash param is "read-only" for re-narrow purposes when its body calls no
+ # mutating method on it -- so its value-type set is established entirely by the
+ # call sites and re-deriving from settled args cannot drop a body-introduced
+ # value kind. Any `[]=` / store / merge! / delete / ... receiver disqualifies.
+  def param_hash_is_read_only(bid, pname)
+    if bid < 0
+      return 0
+    end
+    called = "".split(",", -1)
+    collect_param_methods(bid, pname, called)
+    i = 0
+    while i < called.length
+      m = called[i]
+      if m == "[]=" || m == "store" || m == "merge!" || m == "update" || m == "delete" || m == "clear" || m == "delete_if" || m == "reject!" || m == "select!" || m == "replace"
+        return 0
+      end
+      i = i + 1
+    end
+    return 1
+  end
+
+  def renarrow_poly_hash_params_from_calls
+    saved = "".split(",", -1)
+ # Top-level methods: snapshot + reset.
+    mi = 0
+    while mi < @meth_names.length
+      bid_rn = @meth_body_ids[mi]
+      pnames_rn = @meth_param_names[mi].split(",", -1)
+      ptypes = @meth_param_types[mi].split(",", -1)
+      changed = 0
+      pk = 0
+      while pk < ptypes.length
+        if (ptypes[pk] == "str_poly_hash" || ptypes[pk] == "sym_poly_hash") && pk < pnames_rn.length && param_hash_is_read_only(bid_rn, pnames_rn[pk]) == 1
+          saved.push("m:" + mi.to_s + ":" + pk.to_s + ":" + ptypes[pk])
+          ptypes[pk] = "int"
+          changed = 1
+        end
+        pk = pk + 1
+      end
+      if changed == 1
+        @meth_param_types[mi] = ptypes.join(",")
+      end
+      mi = mi + 1
+    end
+ # Class instance methods: snapshot + reset.
+    ci = 0
+    while ci < @cls_names.length
+      all_ptypes = @cls_meth_ptypes[ci].split("|", -1)
+      bodies_rn = @cls_meth_bodies[ci].split(";", -1)
+      cls_changed = 0
+      mj = 0
+      while mj < all_ptypes.length
+        bid_rn_c = -1
+        if mj < bodies_rn.length
+          bid_rn_c = bodies_rn[mj].to_i
+        end
+        pnames_rn_c = cls_meth_pnames_get(ci, mj)
+        cm_ptypes = all_ptypes[mj].split(",", -1)
+        m_changed = 0
+        pk2 = 0
+        while pk2 < cm_ptypes.length
+          if (cm_ptypes[pk2] == "str_poly_hash" || cm_ptypes[pk2] == "sym_poly_hash") && pk2 < pnames_rn_c.length && param_hash_is_read_only(bid_rn_c, pnames_rn_c[pk2]) == 1
+            saved.push("c:" + ci.to_s + ":" + mj.to_s + ":" + pk2.to_s + ":" + cm_ptypes[pk2])
+            cm_ptypes[pk2] = "int"
+            m_changed = 1
+          end
+          pk2 = pk2 + 1
+        end
+        if m_changed == 1
+          all_ptypes[mj] = cm_ptypes.join(",")
+          cls_changed = 1
+        end
+        mj = mj + 1
+      end
+      if cls_changed == 1
+        @cls_meth_ptypes[ci] = all_ptypes.join("|")
+        @cls_meth_ptypes_version = @cls_meth_ptypes_version + 1
+      end
+      ci = ci + 1
+    end
+    if saved.length == 0
+      return
+    end
+ # Re-derive the reset slots from the now-settled call sites.
+    infer_main_call_types
+    infer_function_body_call_types
+    infer_class_body_call_types
+ # Restore the original poly type for any slot that the re-derivation left at
+ # the int placeholder (no direct caller widened it -- it is reached only via a
+ # poly-receiver dispatch and must keep its poly storage).
+    si = 0
+    while si < saved.length
+      parts = saved[si].split(":", -1)
+      if parts[0] == "m"
+        rmi = parts[1].to_i
+        rpk = parts[2].to_i
+        orig = parts[3]
+        ptypes = @meth_param_types[rmi].split(",", -1)
+        if rpk < ptypes.length && (ptypes[rpk] == "int" || ptypes[rpk] == "nil")
+          ptypes[rpk] = orig
+          @meth_param_types[rmi] = ptypes.join(",")
+        end
+      else
+        rci = parts[1].to_i
+        rmj = parts[2].to_i
+        rpk2 = parts[3].to_i
+        orig2 = parts[4]
+        cur = cls_meth_ptypes_get(rci, rmj)
+        if rpk2 < cur.length && (cur[rpk2] == "int" || cur[rpk2] == "nil")
+          cur[rpk2] = orig2
+          cls_meth_ptypes_put(rci, rmj, cur)
+        end
+      end
+      si = si + 1
     end
   end
 

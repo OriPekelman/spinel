@@ -4770,6 +4770,17 @@ class Compiler
 
   def register_tuple_type(t)
     if is_tuple_type(t) == 1
+ # Canonicalize element types via base_type before dedup, mirroring the
+ # analyze-side registry: tuple:int?,... and tuple:int,... share the
+ # one tuple_c_name (sp_Tuple_int_int_int), so registering both emits a
+ # duplicate typedef. #1180 Array#[]->int? flip.
+      parts_rt = tuple_elem_types_str(t).split(",", -1)
+      kk = 0
+      while kk < parts_rt.length
+        parts_rt[kk] = base_type(parts_rt[kk])
+        kk = kk + 1
+      end
+      t = "tuple:" + parts_rt.join(",")
       k = 0
       found = 0
       while k < @tuple_types.length
@@ -25729,6 +25740,22 @@ class Compiler
         end
         return "sp_IntArray_get(" + rc + ", " + compile_arg0_as_int(nid) + ")"
       end
+      if mname == "fetch"
+ # Array#fetch(i): a checked element read. The analyze side types it
+ # `int` (proven-present, never the nullable `[]` result), so the
+ # compiler's own in-bounds node-id reads stay non-null after the
+ # `[]` -> int? flip. `fetch(i, default)` returns the default on an
+ # out-of-range index; bare `fetch(i)` is a plain get.
+        idx_f = compile_arg0_as_int(nid)
+        fa_id_f = @nd_arguments[nid]
+        if fa_id_f >= 0
+          fa_f = get_args(fa_id_f)
+          if fa_f.length >= 2
+            return "({ sp_IntArray *_fr = " + rc + "; mrb_int _fi = " + idx_f + "; (_fi >= 0 && _fi < sp_IntArray_length(_fr)) ? sp_IntArray_get(_fr, _fi) : " + compile_expr(fa_f[1]) + "; })"
+          end
+        end
+        return "sp_IntArray_get(" + rc + ", " + idx_f + ")"
+      end
       if mname == "push"
         return compile_multi_push(nid, rc, "IntArray")
       end
@@ -39506,7 +39533,7 @@ class Compiler
     if pt == "FloatNode"
  # `case f in 3.14` -- literal float pattern. Same fallthrough
  # silent-match bug as SymbolNode.
-      fval = @nd_value[pat_id]
+      fval = @nd_value[pat_id].to_s
       if pred_type == "poly"
         return "(" + tmp + ".tag == SP_TAG_FLT && " + tmp + ".v.f == " + fval + ")"
       end
@@ -48692,7 +48719,11 @@ class Compiler
     if args_id >= 0
       aargs = get_args(args_id)
       if aargs.length > 0
-        seed_nid = aargs[0]
+ # fetch(0) not [0]: the index is guarded in-bounds, and fetch types
+ # `int` (vs the nullable `[]` element after #1180), so seed_nid stays
+ # a plain node-id rather than unifying with the `-1` sentinel into a
+ # boxed poly slot.
+        seed_nid = aargs.fetch(0)
       end
     end
  # Symbol-to-proc fold operator: either the `&:sym` block arg or a
