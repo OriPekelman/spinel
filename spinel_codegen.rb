@@ -13581,9 +13581,15 @@ class Compiler
     if t == "RetryNode"
       return 1
     end
-    if t == "CallNode" && @nd_name[nid] == "raise"
-      return 1
-    end
+ # A bare `raise` (with no enclosing rescue/ensure/retry in this
+ # function) needs no setjmp scope here: it longjmps to a handler in
+ # a caller (or the top-level net) and never returns, so this frame's
+ # locals never live across a setjmp/longjmp pair *in this function*
+ # and do not need the volatile qualifier. Only the handler-bearing
+ # nodes above establish a setjmp landing pad in this function; the
+ # retry-counter volatile case is covered by the RetryNode/BeginNode
+ # arms, not by the raise itself.
+ #
  # push_child_ids already includes @nd_body, @nd_stmts, and
  # every other AST link -- recursing on those separately would
  # 2x-fan-out per level and explode exponentially on deep bodies
