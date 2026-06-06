@@ -211,7 +211,11 @@ class Compiler
                                "StopIteration", "RegexpError",
                                "EncodingError", "SystemCallError",
                                "LocalJumpError", "FiberError",
-                               "Encoding"]
+                               "Encoding",
+ # IO + File back `.class` on IO/File handles (File < IO < Object).
+ # Appended last so existing builtin cls_ids (Integer=9 .. Proc=20,
+ # hardcoded in sp_class_for_poly) keep their indices.
+                               "IO", "File"]
  # -1 = no parent (root). Module entries (Kernel, Comparable,
  # Enumerable) intentionally have -1 since modules don't
  # have superclasses.
@@ -233,7 +237,8 @@ class Compiler
                                 26, 22,
                                 22, 22,
                                 22, 22,
-                                1]
+                                1,
+                                1, 47]
  # Semicolon-separated module-name includes per built-in class.
     @builtin_class_includes = ["", "Kernel", "", "", "",
                                "", "", "",
@@ -253,7 +258,8 @@ class Compiler
                                "", "",
                                "", "",
                                "", "",
-                               ""]
+                               "",
+                               "", ""]
     @builtin_class_count = @builtin_class_names.length
  # emit-time toggle for the per-program
  # sp_class_names[] table + sp_class_to_s helper. compile_expr's
@@ -4938,6 +4944,9 @@ class Compiler
     if t == "matchdata"
       return 1
     end
+    if t == "io"
+      return 1
+    end
     if is_obj_type(t) == 1
       cname = t[4, t.length - 4]
       ci = find_class_idx(cname)
@@ -5245,6 +5254,11 @@ class Compiler
     end
  # File is a GC-managed wrapper around FILE *.
     if t == "file"
+      return "sp_File *"
+    end
+ # IO handle (IO.pipe ends) -- same sp_File * representation as a File
+ # handle, distinct only at the type level so `.class` reports IO. #1282
+    if t == "io"
       return "sp_File *"
     end
  # Random — per-instance xorshift PRNG.
@@ -29057,6 +29071,24 @@ class Compiler
           return "sp_int_sqrt(" + compile_arg0(nid) + ")"
         end
       end
+ # IO.pipe -> [read_end, write_end], returned as a tuple:io,io so
+ # `r, w = IO.pipe` destructures into two io-typed locals. Each end is
+ # a GC-managed sp_File * over the pipe fd (read buffered "r", write
+ # "w"); existing sp_File_* ops work on it and the "io" type reports
+ # class IO. Issue #1282.
+      if rcname == "IO" && mname == "pipe"
+        tt_pipe = "tuple:io,io"
+        register_tuple_type(tt_pipe)
+        @needs_gc = 1
+        nm_pipe = tuple_c_name(tt_pipe)
+        tmp_pipe = new_temp
+        fds_pipe = "_pipefd" + tmp_pipe
+        emit("  int " + fds_pipe + "[2]; if (pipe(" + fds_pipe + ") != 0) sp_raise_cls(\"IOError\", \"pipe(2) failed\");")
+        emit("  " + nm_pipe + " *" + tmp_pipe + " = (" + nm_pipe + " *)sp_gc_alloc(sizeof(" + nm_pipe + "), NULL, " + tuple_scan_name(tt_pipe) + ");")
+        emit("  " + tmp_pipe + "->_0 = sp_io_fdopen(" + fds_pipe + "[0], \"r\");")
+        emit("  " + tmp_pipe + "->_1 = sp_io_fdopen(" + fds_pipe + "[1], \"w\");")
+        return tmp_pipe
+      end
  # File operations
       if rcname == "File"
         if mname == "read" || mname == "binread"
@@ -30546,6 +30578,10 @@ class Compiler
         prim_class_name_pc = "Hash"
       elsif bt_pc == "proc" || bt_pc == "lambda"
         prim_class_name_pc = "Proc"
+      elsif bt_pc == "file"
+        prim_class_name_pc = "File"
+      elsif bt_pc == "io"
+        prim_class_name_pc = "IO"
       end
       if prim_class_name_pc != ""
         bid_pc = builtin_class_id_for_name(prim_class_name_pc)
@@ -30565,7 +30601,7 @@ class Compiler
  # File method dispatch on an sp_File * handle returned by the
  # non-block `File.open(path, mode)`. Mutating I/O methods are
  # emitted as comma-expressions so they're legal in expr context.
-    if recv_type == "file"
+    if recv_type == "file" || recv_type == "io"
       if mname == "write" || mname == "syswrite"
         return "sp_File_write(" + rc + ", " + compile_expr_as_string(@nd_arguments[nid] >= 0 ? get_args(@nd_arguments[nid])[0] : -1) + ")"
       end

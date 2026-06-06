@@ -1824,6 +1824,16 @@ static sp_File *sp_File_open(const char *path, const char *mode) {
   f->mode = mode;
   return f;
 }
+/* IO.pipe end: wrap a raw pipe fd in a GC-managed sp_File so the
+   sp_File_* I/O ops work on it. Same finalizer/scan as sp_File_open. */
+static sp_File *sp_io_fdopen(int fd, const char *mode) {
+  sp_File *f = (sp_File *)sp_gc_alloc(sizeof(sp_File), sp_File_fin, sp_File_scan);
+  f->fp = fdopen(fd, mode ? mode : "r");
+  if (!f->fp) { sp_raise_cls("IOError", "fdopen failed"); return NULL; }
+  f->path = NULL;
+  f->mode = mode;
+  return f;
+}
 static inline mrb_int sp_File_write(sp_File *f, const char *s) {
   if (!f || !f->fp || !s) return 0;
   size_t n = strlen(s);
@@ -1862,15 +1872,35 @@ static inline const char *sp_File_gets(sp_File *f) {
 static inline const char *sp_File_read(sp_File *f) {
   if (!f || !f->fp) return sp_str_empty;
   long pos = ftell(f->fp);
-  if (pos < 0) pos = 0;
-  if (fseek(f->fp, 0, SEEK_END) != 0) return sp_str_empty;
-  long end = ftell(f->fp);
-  fseek(f->fp, pos, SEEK_SET);
-  long n = (end > pos) ? (end - pos) : 0;
-  if (n <= 0) return sp_str_empty;
-  char *r = sp_str_alloc((size_t)n);
-  size_t got = fread(r, 1, (size_t)n, f->fp);
-  r[got] = 0;
+  if (pos >= 0 && fseek(f->fp, 0, SEEK_END) == 0) {
+    long end = ftell(f->fp);
+    fseek(f->fp, pos, SEEK_SET);
+    long n = (end > pos) ? (end - pos) : 0;
+    if (n <= 0) return sp_str_empty;
+    char *r = sp_str_alloc((size_t)n);
+    size_t got = fread(r, 1, (size_t)n, f->fp);
+    r[got] = 0;
+    return r;
+  }
+  /* Non-seekable stream (IO.pipe end, socket): read to EOF in chunks. */
+  size_t cap = 256, len = 0;
+  char *buf = (char *)malloc(cap);
+  if (!buf) return sp_str_empty;
+  for (;;) {
+    if (len + 4096 + 1 > cap) {
+      cap = (len + 4096 + 1) * 2;
+      char *nb = (char *)realloc(buf, cap);
+      if (!nb) { free(buf); return sp_str_empty; }
+      buf = nb;
+    }
+    size_t got = fread(buf + len, 1, 4096, f->fp);
+    len += got;
+    if (got < 4096) break;
+  }
+  char *r = sp_str_alloc(len);
+  memcpy(r, buf, len);
+  r[len] = 0;
+  free(buf);
   return r;
 }
 static inline mrb_bool sp_File_eof_p(sp_File *f) {

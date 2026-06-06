@@ -3359,7 +3359,7 @@ class Compiler
       end
       if ft != ""
         rt_file = infer_type(recv)
-        return ft if rt_file == "file"
+        return ft if rt_file == "file" || rt_file == "io"
       end
     end
 
@@ -4714,7 +4714,7 @@ class Compiler
         if bt_pc == "int" || bt_pc == "bigint" || bt_pc == "float" ||
            bt_pc == "string" || bt_pc == "mutable_str" || bt_pc == "symbol" ||
            bt_pc == "bool" || bt_pc == "nil" || bt_pc == "range" || bt_pc == "time" ||
-           bt_pc == "encoding" ||
+           bt_pc == "encoding" || bt_pc == "file" || bt_pc == "io" ||
            is_array_type(bt_pc) == 1 || is_hash_type(bt_pc) == 1 ||
            bt_pc == "proc" || bt_pc == "lambda"
           return "class"
@@ -7257,6 +7257,14 @@ class Compiler
             return "file"
           end
         end
+ # IO.pipe -> [read_end, write_end]; both ends are io handles
+ # (sp_File * under the hood). `r, w = IO.pipe` destructures the
+ # homogeneous pair. Issue #1282.
+        if rcname == "IO"
+          if mname == "pipe"
+            return "tuple:io,io"
+          end
+        end
         if rcname == "ENV"
           if mname == "[]"
             return "string"
@@ -8189,6 +8197,9 @@ class Compiler
       return 1
     end
     if t == "proc"
+      return 1
+    end
+    if t == "io"
       return 1
     end
     if is_obj_type(t) == 1
