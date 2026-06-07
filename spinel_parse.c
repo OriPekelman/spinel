@@ -2048,32 +2048,95 @@ static char *rewrite_syntax_sugar(char *source) {
       REWRITE_SEND_CALL(".public_send(\"", 14, 1);
       continue;
     }
-    /* (&:symbol) → { |_spx| _spx.symbol } — also remove enclosing parens */
+    /* `&:symbol` symbol-to-proc. Prism parses `&:sym` natively, but
+       Spinel only lowers the native BlockArgumentNode+SymbolNode shape
+       for a few methods (inject / reduce / sort_by); general block
+       takers rely on this textual rewrite to an explicit block. The
+       block has to land where Ruby reads it as a block, not a hash:
+         - sole parenthesized arg `m(&:s)`   -> `m { |_spx| _spx.s }`
+         - after a positional, paren call
+           `m(a, &:s)`                       -> `m(a) { |_spx| _spx.s }`
+         - after a positional, command call
+           `m a, &:s`                        -> `m a do |_spx| _spx.s end`
+         - command-position sole arg `m &:s` -> `m  { |_spx| _spx.s }`
+       The bare `{ |_spx| ... }` was only correct in block position; a
+       `,`-prefixed brace parses as a hash literal, which was the bundler
+       (`File.open(f, "r:UTF-8", &:read)`) / minitest
+       (`define_method :mu_pp, &:pretty_inspect`) parse failure.
+
+       Operator symbols (`&:+`) have name_len 0 here and are left for
+       Prism's native path (the arith reduce/inject lowering handles
+       them). Known limitation: a paren-less command carrying a
+       symbol-proc that is itself nested as an argument inside a paren
+       call -- `p(foo :a, &:s)` -- mis-binds the block to the outer
+       call, because textually its args sit at the same paren depth as
+       the enclosing call (indistinguishable without re-implementing
+       Ruby's command/arg disambiguation). Neither target gem hits
+       this; a robust fix is an AST-level lowering, deferred. */
     if (i + 2 < len && source[i] == '&' && source[i + 1] == ':') {
-      /* Check if preceded by ( and remove it */
-      int had_paren = 0;
-      if (oi > 0 && out[oi - 1] == '(') { oi--; had_paren = 1; }
+      /* Last emitted non-space char. Skip newlines too so a multi-line
+         `m(a,\n  &:s)` still sees the comma. */
+      size_t back = oi;
+      while (back > 0 && (out[back - 1] == ' ' || out[back - 1] == '\t' ||
+                          out[back - 1] == '\n' || out[back - 1] == '\r')) back--;
+      char prev = (back > 0) ? out[back - 1] : '\0';
       i += 2;
       size_t ns = i;
       while (i < len && (source[i] == '_' || (source[i] >= 'a' && source[i] <= 'z') ||
              (source[i] >= 'A' && source[i] <= 'Z') || (source[i] >= '0' && source[i] <= '9') ||
              source[i] == '?' || source[i] == '!')) i++;
       size_t name_len = i - ns;
-      if (name_len > 0) {
-        /* Issue #792: skip any whitespace between the symbol name
-           and the closing paren so `(&:bar )` matches the same way
-           `(&:bar)` does. */
-        if (had_paren) {
-          while (i < len && (source[i] == ' ' || source[i] == '\t')) i++;
-          if (i < len && source[i] == ')') i++;
-        }
+      if (name_len == 0) {
+        /* Operator / empty symbol: leave `&:` for Prism's native path. */
+        OUT_STR("&:");
+        continue;
+      }
+      if (prev == '(') {
+        /* Sole parenthesized arg: drop the `(` (and any trailing ws)
+           and the matching `)` so the block binds paren-less. #792:
+           tolerate whitespace before the `)`. Restore `i` if no `)`
+           follows so trailing content isn't swallowed. */
+        oi = back - 1;
+        size_t after_sym = i;
+        while (i < len && (source[i] == ' ' || source[i] == '\t' ||
+                           source[i] == '\n' || source[i] == '\r')) i++;
+        if (i < len && source[i] == ')') i++;
+        else i = after_sym;
         OUT_STR(" { |_spx| _spx.");
-        size_t k; for (k = 0; k < name_len; k++) OUT_CHAR(source[ns + k]);
+        { size_t k; for (k = 0; k < name_len; k++) OUT_CHAR(source[ns + k]); }
         OUT_STR(" }");
         continue;
       }
-      if (had_paren) OUT_CHAR('('); /* restore if failed */
-      OUT_STR("&:");
+      if (prev == ',') {
+        /* After a positional arg. Drop the separating comma and
+           relocate the block: a parenthesized call closes first then
+           takes a brace block; a command call takes a trailing do..end
+           (a brace would still read as a hash). Only consume up to the
+           `)`; otherwise restore `i` so the newline/`end` that follows
+           a paren-less command is preserved. */
+        oi = back - 1;
+        size_t after_sym = i;
+        while (i < len && (source[i] == ' ' || source[i] == '\t' ||
+                           source[i] == '\n' || source[i] == '\r')) i++;
+        if (i < len && source[i] == ')') {
+          i++;
+          OUT_CHAR(')');
+          OUT_STR(" { |_spx| _spx.");
+          { size_t k; for (k = 0; k < name_len; k++) OUT_CHAR(source[ns + k]); }
+          OUT_STR(" }");
+        } else {
+          i = after_sym;
+          OUT_STR(" do |_spx| _spx.");
+          { size_t k; for (k = 0; k < name_len; k++) OUT_CHAR(source[ns + k]); }
+          OUT_STR(" end");
+        }
+        continue;
+      }
+      /* Command-position sole arg (`m &:s`): the brace binds as a
+         block (no comma precedes it). */
+      OUT_STR(" { |_spx| _spx.");
+      { size_t k; for (k = 0; k < name_len; k++) OUT_CHAR(source[ns + k]); }
+      OUT_STR(" }");
       continue;
     }
     OUT_CHAR(source[i]);
