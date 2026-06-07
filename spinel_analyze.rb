@@ -2833,6 +2833,17 @@ class Compiler
         end
       end
       et = infer_type(elems[0])
+ # A poly (sp_RbVal) first element — e.g. `[a, b]` where a, b were
+ # destructured from a heterogeneous multi-return tuple (poly slots)
+ # or otherwise widened to poly. The element is already boxed, so the
+ # literal is a poly_array; the int_array default at the bottom would
+ # otherwise emit `sp_IntArray_push((lv_a).v.i)`, unboxing the poly
+ # as a raw int.
+      if et == "poly"
+        @needs_gc = 1
+        @needs_rb_value = 1
+        return "poly_array"
+      end
       if et == "symbol"
  # Check if ALL elements are symbols
         all_sym = 1
@@ -8134,6 +8145,37 @@ class Compiler
       return parts[idx]
     end
     "int"
+  end
+
+  def tuple_arity(t)
+    tuple_elem_types_str(t).split(",", -1).length
+  end
+
+ # Unify two same-arity tuple types element-wise. A position where
+ # the two element types disagree widens to `poly`; positions that
+ # match keep their concrete type. Used to merge divergent
+ # `return a, b` paths in unify_return_type. Two identical tuples
+ # round-trip to the same string (every position agrees), so the
+ # homogeneous case is unchanged.
+  def unify_two_tuple_types(a, b)
+    pa = tuple_elem_types_str(a).split(",", -1)
+    pb = tuple_elem_types_str(b).split(",", -1)
+    out = "".split(",", -1)
+    i = 0
+    while i < pa.length
+      ea = pa[i]
+      eb = "int"
+      if i < pb.length
+        eb = pb[i]
+      end
+      if ea == eb
+        out.push(ea)
+      else
+        out.push("poly")
+      end
+      i = i + 1
+    end
+    "tuple:" + out.join(",")
   end
 
 
@@ -24535,6 +24577,19 @@ class Compiler
           result = t
         elsif t == "int"
  # int is default/unresolved — keep existing result
+        elsif is_tuple_type(result) == 1 && is_tuple_type(t) == 1 && tuple_arity(result) == tuple_arity(t)
+ # Two `return a, b` paths whose element types disagree (e.g.
+ # `return s, s` => tuple:string,string vs `return nil, nil`
+ # => tuple:nil,nil). A scalar `poly` here would force the
+ # caller onto the (less-exercised) boxed-scalar destructure
+ # path; instead unify element-wise into a same-arity tuple
+ # whose disagreeing positions widen to `poly`. Positions that
+ # already agree keep their concrete type, so the function
+ # signature stays a tuple and the existing tuple destructure
+ # machinery (tuple_elem_type_at -> per-slot poly) applies.
+          merged_tt = unify_two_tuple_types(result, t)
+          register_tuple_type(merged_tt)
+          result = merged_tt
         else
  # Genuinely different types
           return "poly"

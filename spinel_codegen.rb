@@ -4274,6 +4274,14 @@ class Compiler
         end
       end
       et = infer_type(elems[0])
+ # A poly (sp_RbVal) first element is already boxed; the literal is a
+ # poly_array. Mirrors spinel_analyze.rb; without it the int_array
+ # default unboxes the poly via (lv_x).v.i.
+      if et == "poly"
+        @needs_gc = 1
+        @needs_rb_value = 1
+        return "poly_array"
+      end
       if et == "symbol"
  # Check if ALL elements are symbols
         all_sym = 1
@@ -9241,6 +9249,13 @@ class Compiler
           result = t
         elsif t == "int"
  # int is default/unresolved — keep existing result
+        elsif is_tuple_type(result) == 1 && is_tuple_type(t) == 1 && tuple_arity(result) == tuple_arity(t)
+ # Divergent `return a, b` paths: unify element-wise into a
+ # same-arity tuple whose disagreeing positions widen to `poly`
+ # (mirrors spinel_analyze.rb's unify_return_type).
+          merged_tt = unify_two_tuple_types(result, t)
+          register_tuple_type(merged_tt)
+          result = merged_tt
         else
  # Genuinely different types
           return "poly"
@@ -9262,6 +9277,30 @@ class Compiler
       end
     end
     result
+  end
+
+ # Unify two same-arity tuple types element-wise; disagreeing
+ # positions widen to `poly`. Identical tuples round-trip
+ # unchanged. Mirrors spinel_analyze.rb.
+  def unify_two_tuple_types(a, b)
+    pa = tuple_elem_types_str(a).split(",", -1)
+    pb = tuple_elem_types_str(b).split(",", -1)
+    out = "".split(",", -1)
+    i = 0
+    while i < pa.length
+      ea = pa[i]
+      eb = "int"
+      if i < pb.length
+        eb = pb[i]
+      end
+      if ea == eb
+        out.push(ea)
+      else
+        out.push("poly")
+      end
+      i = i + 1
+    end
+    "tuple:" + out.join(",")
   end
 
  # ---- Feature detection ----
@@ -40458,12 +40497,30 @@ class Compiler
  # `return a, b [, c]` — materialize as a fixed-arity tuple struct.
         @needs_gc = 1
         tt = tuple_type_from_elems(arg_ids)
-        tname = tuple_c_name(tt)
+ # When this method has multiple `return a, b` paths whose element
+ # types disagree, unify_return_type widened the method return to a
+ # same-arity tuple with `poly` in the disagreeing positions (e.g.
+ # `sp_Tuple_poly_poly`). The function signature is that unified
+ # tuple, so this path's tuple struct must match it — otherwise the
+ # local `sp_Tuple_string_string *` is returned where `sp_Tuple_poly_poly *`
+ # is expected (incompatible-types). Use the method return tuple as
+ # the struct type and box each field whose unified slot is `poly`.
+        unified_tt = tt
+        if is_tuple_type(@current_method_return) == 1 && tuple_arity(@current_method_return) == arg_ids.length
+          unified_tt = @current_method_return
+        end
+        tname = tuple_c_name(unified_tt)
         arr_tmp = new_temp
-        emit("  " + tname + " *" + arr_tmp + " = (" + tname + " *)sp_gc_alloc(sizeof(" + tname + "), NULL, " + tuple_scan_name(tt) + ");")
+        emit("  " + tname + " *" + arr_tmp + " = (" + tname + " *)sp_gc_alloc(sizeof(" + tname + "), NULL, " + tuple_scan_name(unified_tt) + ");")
         k = 0
         while k < arg_ids.length
-          emit("  " + arr_tmp + "->_" + k.to_s + " = " + compile_expr(arg_ids[k]) + ";")
+          fld_val = compile_expr(arg_ids[k])
+          slot_t = tuple_elem_type_at(unified_tt, k)
+          elem_t = infer_type(arg_ids[k])
+          if base_type(slot_t) == "poly" && base_type(elem_t) != "poly"
+            fld_val = box_value_to_poly(elem_t, fld_val)
+          end
+          emit("  " + arr_tmp + "->_" + k.to_s + " = " + fld_val + ";")
           k = k + 1
         end
  # Replay any in-scope `ensure` bodies before the return.
