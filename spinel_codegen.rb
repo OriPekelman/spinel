@@ -6341,9 +6341,10 @@ class Compiler
  # call's C expression (the historical silent-no-op behaviour) so
  # existing tests/benches whose outputs happen to coincide with `0`
  # keep compiling.
-  def warn_unresolved_call(mname, recv_tag)
+  def warn_unresolved_call(mname, recv_tag, nid = -1)
     ctx = current_method_context_str
-    key = mname + ":" + recv_tag + ":" + ctx
+    lsuf = warn_line_suffix(nid)
+    key = mname + ":" + recv_tag + ":" + ctx + ":" + lsuf
     i = 0
     while i < @unresolved_call_warnings.length
       if @unresolved_call_warnings[i] == key
@@ -6352,7 +6353,22 @@ class Compiler
       i = i + 1
     end
     @unresolved_call_warnings.push(key)
-    $stderr.puts "warning: in " + ctx + ": cannot resolve call to '" + mname + "' on " + recv_tag + " (emitting 0)"
+    $stderr.puts "warning: in " + ctx + lsuf + ": cannot resolve call to '" + mname + "' on " + recv_tag + " (emitting 0)"
+  end
+
+ # Render " (line N)" for a diagnostic when per-node source lines were
+ # stamped (--line-map / SPINEL_DEBUG, the default for `./spinel app.rb`
+ # via the driver). Empty when no line is available -- e.g. the bootstrap
+ # parse path doesn't stamp lines (@nd_line stays 0) -- so the warning
+ # degrades cleanly to its line-less form.
+  def warn_line_suffix(nid)
+    if nid >= 0 && nid < @nd_line.length
+      ln = @nd_line[nid]
+      if ln > 0
+        return " (line " + ln.to_s + ")"
+      end
+    end
+    ""
   end
 
  # Same dedupe pattern as warn_unresolved_call but for unknown
@@ -19734,7 +19750,7 @@ class Compiler
  # on (`@hook && @hook.fire(...)` where @hook starts nil and is
  # later assigned). Keep the warn for visibility, fall back to
  # silent 0 on int/poly recvs.
-    warn_unresolved_call(mname, base_type(recv_type))
+    warn_unresolved_call(mname, base_type(recv_type), nid)
     rb_unr = base_type(recv_type)
     if rb_unr == "int" || rb_unr == "poly" || rb_unr == "nil"
       return "0"
@@ -20517,7 +20533,7 @@ class Compiler
  # user sees the problem is far better than a silently-empty binary.
  # See the matching warn at the receiver-form fallthrough above for
  # why this is a warn-and-emit-0 rather than a hard error.
-    warn_unresolved_call(mname, "(no receiver)")
+    warn_unresolved_call(mname, "(no receiver)", nid)
     "0"
   end
 
@@ -23733,7 +23749,7 @@ class Compiler
           return "sp_str_byteslice(" + rc + ", " + compile_expr_as_int(a_bsl[0]) + ", 1)"
         end
       end
-      warn_unresolved_call(mname, "string")
+      warn_unresolved_call(mname, "string", nid)
       return "0"
     end
  # String#ascii_only? -- true iff every byte is 7-bit ASCII.
@@ -23781,7 +23797,7 @@ class Compiler
           return "sp_str_setbyte(" + rc + ", " + compile_expr_as_int(a_sb[0]) + ", " + compile_expr_as_int(a_sb[1]) + ")"
         end
       end
-      warn_unresolved_call(mname, "string")
+      warn_unresolved_call(mname, "string", nid)
       return "0"
     end
     if mname == "bytesize"
@@ -32087,7 +32103,7 @@ class Compiler
  # `cannot resolve call to 'X' on Y (emitting 0)` pattern so editors
  # / CI grep for compile noise still surface this case.
     if poly_dispatch_arms_emitted == 0
-      warn_unresolved_call(mname, "poly (no concrete user-class arm)")
+      warn_unresolved_call(mname, "poly (no concrete user-class arm)", nid)
     end
     tmp
   end
@@ -49141,7 +49157,7 @@ class Compiler
       if disp != ""
         emit("  lv_" + bp1 + " = " + disp + ";")
       else
-        warn_unresolved_call(sym_op, elem_t)
+        warn_unresolved_call(sym_op, elem_t, nid)
       end
     else
       blk = @nd_block[nid]
