@@ -19390,6 +19390,123 @@ class Compiler
     end
   end
 
+ # spinel-dev#11: the receiver-aware counterpart of
+ # infer_param_type_from_callee_slot, for *instance* methods. A class instance
+ # method that is never called has no call site to constrain its params, so an
+ # `int`-default param it merely forwards into `<typed_recv>.<meth>(param)` stays
+ # `int` and then mismatches the callee's concrete C param (`int` vs `sp_Cfg`),
+ # breaking the C build of the (dead-but-emitted) body. infer_param_type_from_
+ # callee_slot only covers top-level/cmeth callees (callee_slot_type resolves
+ # those), not receiver-dispatched instance methods. So: walk the body, resolve
+ # each forwarding receiver to its class, look up that class's instance method's
+ # param slot, and pin the `int`-default param to the agreed obj type. Pure
+ # narrowing (more precise typing of the forwarding method), so it can't widen a
+ # shared method or cause a miscompile.
+  def collect_param_instance_callee_types(nid, pname, acc)
+    if nid < 0
+      return
+    end
+    if @nd_type[nid] == "DefNode" || @nd_type[nid] == "ClassNode" || @nd_type[nid] == "ModuleNode"
+      return
+    end
+    if @nd_type[nid] == "CallNode"
+      recv = @nd_receiver[nid]
+      args_id = @nd_arguments[nid]
+      if recv >= 0 && args_id >= 0
+        rt = base_type(infer_type(recv))
+        if is_obj_type(rt) == 1
+          cname = rt[4, rt.length - 4]
+          cci = find_class_idx(cname)
+          if cci >= 0
+            midx = cls_find_method_direct(cci, @nd_name[nid])
+            if midx >= 0
+              cpts = cls_meth_ptypes_get(cci, midx)
+              aargs = get_args(args_id)
+              ai = 0
+              while ai < aargs.length
+                if @nd_type[aargs[ai]] == "LocalVariableReadNode" && @nd_name[aargs[ai]] == pname && ai < cpts.length
+                  acc.push(cpts[ai])
+                end
+                ai = ai + 1
+              end
+            end
+          end
+        end
+      end
+    end
+    cs = []
+    push_child_ids(nid, cs)
+    k = 0
+    while k < cs.length
+      collect_param_instance_callee_types(cs[k], pname, acc)
+      k = k + 1
+    end
+  end
+
+  def infer_instance_param_from_callee_slot
+    ci = 0
+    while ci < @cls_names.length
+      mnames = @cls_meth_names[ci].split(";", -1)
+      bodies = @cls_meth_bodies[ci].split(";", -1)
+      saved_ci = @current_class_idx
+      @current_class_idx = ci
+      mi = 0
+      while mi < mnames.length
+        bid = -1
+        if mi < bodies.length
+          bid = bodies[mi].to_i
+        end
+        if bid >= 0
+          ptypes = cls_meth_ptypes_get(ci, mi)
+          pnames = cls_meth_pnames_get(ci, mi)
+ # Declare the method's params in scope so a receiver that *is* a
+ # param (`engine.realize(cfg)`) resolves; literal receivers
+ # (`Engine.new.realize(cfg)`) don't need it but it's harmless.
+          push_scope
+          pk0 = 0
+          while pk0 < pnames.length && pk0 < ptypes.length
+            declare_var(pnames[pk0], ptypes[pk0])
+            pk0 = pk0 + 1
+          end
+          changed = 0
+          pk = 0
+          while pk < pnames.length && pk < ptypes.length
+            if ptypes[pk] == "int"
+              acc = "".split(",", -1)
+              collect_param_instance_callee_types(bid, pnames[pk], acc)
+              agreed = ""
+              disagree = 0
+              kk = 0
+              while kk < acc.length
+                t = acc[kk]
+                if is_obj_type(t) == 1
+                  if agreed == ""
+                    agreed = t
+                  elsif agreed != t
+                    disagree = 1
+                  end
+                end
+                kk = kk + 1
+              end
+              if agreed != "" && disagree == 0
+                ptypes[pk] = agreed
+                changed = 1
+              end
+            end
+            pk = pk + 1
+          end
+          pop_scope
+          if changed == 1
+            cls_meth_ptypes_put(ci, mi, ptypes)
+          end
+        end
+        mi = mi + 1
+      end
+      @current_class_idx = saved_ci
+      ci = ci + 1
+    end
+  end
+
   def callee_slot_type(callee_name, pos)
     cmi = find_method_idx(callee_name)
     if cmi >= 0
@@ -28444,6 +28561,7 @@ class Compiler
       widen_nil_default_params_used_as_hash
       widen_params_from_ivar_hash_aset
       infer_param_type_from_callee_slot
+      infer_instance_param_from_callee_slot
  # Kwarg back-propagation: int/nil-defaulted kwarg params
  # that pass through to a typed callee kwarg (same name)
  # pick up the callee's slot type. Issue #561.
