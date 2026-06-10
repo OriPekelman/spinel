@@ -19413,12 +19413,25 @@ class Compiler
       recv = @nd_receiver[nid]
       args_id = @nd_arguments[nid]
       if recv >= 0 && args_id >= 0
-        rt = base_type(infer_type(recv))
-        if is_obj_type(rt) == 1
-          cname = rt[4, rt.length - 4]
+        cname = ""
+        meth = @nd_name[nid]
+ # spinel-dev#12: a constructor is a callee slot too. `Klass.new(param)`
+ # dispatches on the class constant, not a typed receiver, so the
+ # obj-type path below never sees it; resolve the constant and pin from
+ # Klass#initialize's param slot instead.
+        if meth == "new"
+          cname = constructor_class_name(recv)
+          meth = "initialize"
+        else
+          rt = base_type(infer_type(recv))
+          if is_obj_type(rt) == 1
+            cname = rt[4, rt.length - 4]
+          end
+        end
+        if cname != ""
           cci = find_class_idx(cname)
           if cci >= 0
-            midx = cls_find_method_direct(cci, @nd_name[nid])
+            midx = cls_find_method_direct(cci, meth)
             if midx >= 0
               cpts = cls_meth_ptypes_get(cci, midx)
               aargs = get_args(args_id)
