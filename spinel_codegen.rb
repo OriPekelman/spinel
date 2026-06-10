@@ -7551,7 +7551,21 @@ class Compiler
  # call-duration lifetime (same contract as `:str`). Cast hides
  # the mrb_float/mrb_int -> double/int64_t typedef-vs-spelling
  # mismatch (both widths match on every supported target).
-        result = result + "((" + ctype + ")(" + compile_expr(call_args[k]) + ")->data)"
+ # A poly_array arg can't be handed out raw — its slots are boxed
+ # sp_RbVal, not int64/double, so the C side would read tags as
+ # data (spinel-dev#13). Unbox into a fresh concrete array via the
+ # runtime bridge; call-duration lifetime, same contract as above.
+        if base_type(infer_type(call_args[k])) == "poly_array"
+          @needs_rb_value = 1
+          @needs_gc = 1
+          if spec == "int_array"
+            result = result + "sp_PolyArray_ffi_int_data((sp_PolyArray *)(" + compile_expr(call_args[k]) + "))"
+          else
+            result = result + "sp_PolyArray_ffi_float_data((sp_PolyArray *)(" + compile_expr(call_args[k]) + "))"
+          end
+        else
+          result = result + "((" + ctype + ")(" + compile_expr(call_args[k]) + ")->data)"
+        end
       else
  # Numeric FFI param (int / uint32 / float / double / ...) with a
  # poly-typed arg expression: cast the sp_RbVal struct directly
@@ -8256,6 +8270,36 @@ class Compiler
           return dst_pa
         end
       end
+    end
+ # `poly_array → int_array / float_array` at the call boundary — the
+ # reverse of the #582 convert above. The callee's param is pinned
+ # concrete (e.g. by an FFI :int_array spec) while this caller's value
+ # emits poly_array: since the divergent-tuple unification an array
+ # literal whose element widened to poly is a PolyArray, whose sp_RbVal
+ # slots are layout-incompatible with IntArray's raw mrb_int slots.
+ # Without a convert the C pointer-puns (`sp_IntArray *x = <PolyArray>`)
+ # and a bulk-FFI consumer reads boxed tags as data — toy's ggml_abort
+ # in decode_step (spinel-dev#13). Unbox element-wise; a poly slot
+ # holding an int/float carries it in .v.i/.v.f (same contract as the
+ # scalar poly FFI args, #626).
+    if (expected_base == "int_array" || expected_base == "float_array") && at == "poly_array"
+      @needs_gc = 1
+      @needs_rb_value = 1
+      src_pi = new_temp
+      dst_pi = new_temp
+      ii_pi = new_temp
+      emit("  sp_PolyArray *" + src_pi + " = " + val + ";")
+      emit("  SP_GC_ROOT(" + src_pi + ");")
+      if expected_base == "int_array"
+        emit("  sp_IntArray *" + dst_pi + " = sp_IntArray_new();")
+        emit("  SP_GC_ROOT(" + dst_pi + ");")
+        emit("  for (mrb_int " + ii_pi + " = 0; " + ii_pi + " < sp_PolyArray_length(" + src_pi + "); " + ii_pi + "++) sp_IntArray_push(" + dst_pi + ", sp_PolyArray_get(" + src_pi + ", " + ii_pi + ").v.i);")
+      else
+        emit("  sp_FloatArray *" + dst_pi + " = sp_FloatArray_new();")
+        emit("  SP_GC_ROOT(" + dst_pi + ");")
+        emit("  for (mrb_int " + ii_pi + " = 0; " + ii_pi + " < sp_PolyArray_length(" + src_pi + "); " + ii_pi + "++) sp_FloatArray_push(" + dst_pi + ", sp_PolyArray_get(" + src_pi + ", " + ii_pi + ").v.f);")
+      end
+      return dst_pi
     end
     if expected_base == "string"
       if at == "poly"
