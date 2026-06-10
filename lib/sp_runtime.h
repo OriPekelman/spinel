@@ -3774,7 +3774,14 @@ static const char *sp_file_read(const char *path) {
     sp_raise_cls("Errno::EISDIR", sp_sprintf("Is a directory @ io_fread - %s", path));
   }
   FILE *f = fopen(path, "r");
-  if (!f) return &("\xff" "")[1];
+  /* CRuby contract: a failed open raises (Errno::ENOENT for a missing
+     path), it does not yield "". The silent empty string let a missing
+     input flow deep into programs until something dereferenced garbage
+     (no-output SIGSEGV far from the one-line cause). spinel-dev#17;
+     same raise shape as File.mtime below. */
+  if (!f) {
+    sp_raise_cls(errno == ENOENT ? "Errno::ENOENT" : "RuntimeError", sp_sprintf("%s @ rb_sysopen - %s", strerror(errno), path));
+  }
   fseek(f, 0, SEEK_END);
   long sz = ftell(f);
   fseek(f, 0, SEEK_SET);
@@ -3793,10 +3800,14 @@ static void sp_file_write(const char *path, const char *data) {
     sp_raise_cls("Errno::EISDIR", sp_sprintf("Is a directory @ rb_sysopen - %s", path));
   }
   FILE *f = fopen(path, "wb");
-  if (f) {
-    fwrite(data, 1, sp_str_byte_len(data), f);
-    fclose(f);
+  /* Same contract as sp_file_read: a failed open raises (ENOENT for a
+     missing directory component, EACCES for permissions), it does not
+     silently drop the write. spinel-dev#17. */
+  if (!f) {
+    sp_raise_cls(errno == ENOENT ? "Errno::ENOENT" : (errno == EACCES ? "Errno::EACCES" : "RuntimeError"), sp_sprintf("%s @ rb_sysopen - %s", strerror(errno), path));
   }
+  fwrite(data, 1, sp_str_byte_len(data), f);
+  fclose(f);
 }
 static mrb_bool sp_file_exist(const char *path) { FILE *f = fopen(path, "r"); if (f) { fclose(f); return TRUE; } return FALSE; }
 static void sp_file_delete(const char *path) { remove(path); }
@@ -4065,7 +4076,11 @@ static sp_IntArray *sp_file_binread_bytes(const char *path) {
   }
   FILE *f = fopen(path, "rb");
   sp_IntArray *a = sp_IntArray_new();
-  if (!f) return a;
+  /* CRuby raises on a failed binread open too — an empty byte array is
+     the same silent-"" trap as sp_file_read. spinel-dev#17. */
+  if (!f) {
+    sp_raise_cls(errno == ENOENT ? "Errno::ENOENT" : "RuntimeError", sp_sprintf("%s @ rb_sysopen - %s", strerror(errno), path));
+  }
   fseek(f, 0, SEEK_END);
   long sz = ftell(f);
   fseek(f, 0, SEEK_SET);
