@@ -9606,7 +9606,14 @@ class Compiler
 
   def symbol_file_path(fid)
     if fid != nil && fid >= 0 && fid < @file_table.length
-      p = @file_table[fid]
+ # .to_s anchor: under self-host the @file_table element read can
+ # land on poly (the table is filled in compiler_helpers across the
+ # require boundary), which poisons this return — and with it
+ # sym_json_escape's param — to poly with no concrete arm, so the
+ # escape loop emitted 0 and every --emit-symbol-map string field
+ # came out "" from the self-hosted binary (CRuby codegen was
+ # fine). spinel-dev#16.
+      p = @file_table[fid].to_s
       if p != nil && p != ""
         return p
       end
@@ -9617,7 +9624,10 @@ class Compiler
     "source.rb"
   end
 
-  def sym_json_escape(s)
+  def sym_json_escape(s0)
+ # Same self-host anchor as symbol_file_path: keep the escape input
+ # a concrete string even if a caller's arg slot degraded to poly.
+    s = s0.to_s
     out = ""
     i = 0
     while i < s.length
