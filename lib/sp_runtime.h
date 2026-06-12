@@ -2995,6 +2995,14 @@ static sp_RbVal sp_poly_shl(sp_RbVal a, sp_RbVal b) {
 }
 static mrb_int sp_PolyArray_length(sp_PolyArray *a) { if (!a) return 0; return a->len; }
 static sp_RbVal sp_PolyArray_get(sp_PolyArray *a, mrb_int i) { if (!a) return sp_box_nil(); if (i < 0) i += a->len; if (i < 0 || i >= a->len) return sp_box_nil(); return a->data[i]; }
+/* Bulk-FFI bridge for a poly_array reaching an :int_array / :float_array
+   spec (spinel-dev#13 family): PolyArray slots are boxed sp_RbVal, so the
+   zero-copy `->data` hand-off would let C read tags as data. Unbox into a
+   fresh concrete array and hand out ITS storage; call-duration lifetime,
+   same contract as the zero-copy path. A poly slot holding an int/float
+   carries it in .v.i/.v.f (same unbox contract as the scalar FFI args). */
+static inline const int64_t *sp_PolyArray_ffi_int_data(sp_PolyArray *a) { sp_IntArray *r = sp_IntArray_new(); if (a) { for (mrb_int i = 0; i < a->len; i++) sp_IntArray_push(r, a->data[i].v.i); } return (const int64_t *)r->data; }
+static inline const double *sp_PolyArray_ffi_float_data(sp_PolyArray *a) { sp_FloatArray *r = sp_FloatArray_new(); if (a) { for (mrb_int i = 0; i < a->len; i++) sp_FloatArray_push(r, a->data[i].v.f); } return (const double *)r->data; }
 /* Issues #770, #789: NULL + bounds guard. Out-of-range set no-ops. */
 static void sp_PolyArray_set(sp_PolyArray *a, mrb_int i, sp_RbVal v) { if (!a) return; if (a->frozen) { sp_raise_frozen_array(); return; } mrb_int orig=i; if (i < 0) i += a->len; if (i < 0) sp_raise_cls("IndexError", sp_sprintf("index %lld too small for array; minimum: %lld",(long long)orig,(long long)-a->len)); if (i >= a->len) return; a->data[i] = v; }
 static sp_PolyArray *sp_PolyArray_slice(sp_PolyArray *a, mrb_int start, mrb_int len) { if (start < 0) start += a->len; if (start < 0) start = 0; sp_PolyArray *b = sp_PolyArray_new(); if (start >= a->len || len <= 0) return b; if (start + len > a->len) len = a->len - start; for (mrb_int i = 0; i < len; i++) sp_PolyArray_push(b, a->data[start + i]); return b; }
