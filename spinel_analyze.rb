@@ -13262,6 +13262,24 @@ class Compiler
                 k = k + 1
                 next
               end
+ # Refinement, not disagreement: an INDEFINITE int_array is
+ # infer_array_elem_type's bottom fallback for a literal
+ # whose element is an unresolvable CallNode at Pass-1 scan
+ # time — `[FiberSlot.new(f)]` scanned before FiberSlot is
+ # registered types the ctor int (#1305's fallback) and the
+ # literal int_array. The writer-scan re-infers the same
+ # write with the full class table; its typed ptr_array is
+ # the real element type, so adopt it instead of widening to
+ # poly_array. A definite literal (`@x = [1, 2]`) keeps the
+ # widening — that disagreement is genuine heterogeneity.
+ # spinel-dev#14 (toy serve's sched_fibers facet of #1369).
+              if old == "int_array" && is_ptr_array_type(new_type) == 1 && cls_ivar_definite_flag(ci, iname) == 0
+                types[k] = new_type
+                @cls_ivar_types[ci] = types.join(";")
+                @cls_ivar_types_version = @cls_ivar_types_version + 1
+                k = k + 1
+                next
+              end
               types[k] = "poly_array"
               @needs_rb_value = 1
               @cls_ivar_types[ci] = types.join(";")
@@ -13593,6 +13611,27 @@ class Compiler
         end
       end
     end
+ # An array literal is definite iff non-empty and every element is
+ # itself definite (`[1, 2]`, `["a"]`). An element that is a CallNode
+ # — e.g. a constructor result, `[FiberSlot.new(f)]` — keeps the
+ # literal indefinite: at Pass-1 scan time the ctor's class may not
+ # be registered yet (require order), so the scanned element type is
+ # the int fallback (#1305), a placeholder for the writer-scan to
+ # refine rather than a definite observation. spinel-dev#14.
+    if t == "ArrayNode"
+      elems = parse_id_list(@nd_elements[nid])
+      if elems.length == 0
+        return 0
+      end
+      k = 0
+      while k < elems.length
+        if is_definite_ivar_init(elems[k]) == 0
+          return 0
+        end
+        k = k + 1
+      end
+      return 1
+    end
  # A ternary whose branches are themselves definite is itself
  # definite. Lets the multi-write poly-widening rule still fire
  # when a later concrete write disagrees with an IfNode-typed
@@ -13875,7 +13914,16 @@ class Compiler
             new_def = is_definite_ivar_init(expr)
             cur_def = cls_ivar_definite_flag(ci, iname)
             if new_def == 1 && cur_def == 1 && cur != vtype && cur != "poly"
-              replace_ivar_type(ci, iname, "poly")
+ # Two definite array literals with disagreeing element
+ # types (`@x = [1]` ... `@x = ["a"]`) are still an array
+ # at runtime — a poly_array of boxed elements, not a
+ # scalar poly slot. (Array literals became eligible for
+ # definiteness with the ArrayNode arm above.)
+              if is_array_type(cur) == 1 && is_array_type(vtype) == 1
+                replace_ivar_type(ci, iname, "poly_array")
+              else
+                replace_ivar_type(ci, iname, "poly")
+              end
               @needs_rb_value = 1
             elsif vtype != "int"
               update_ivar_type(ci, iname, vtype)
